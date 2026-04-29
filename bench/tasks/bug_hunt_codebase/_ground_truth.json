@@ -1,0 +1,95 @@
+{
+  "comment": "Ground truth for the bug_hunt_codebase task. Not shown to the model.",
+  "bugs": [
+    {
+      "id": "B1_dlq_does_not_delete",
+      "file": "storage.py",
+      "function": "move_to_dead_letter",
+      "summary": "Copies the row into dead_letter but never DELETEs it from deliveries; dispatcher will keep re-picking it because delivered_at is still NULL.",
+      "keywords": ["dead_letter", "delete", "deliveries", "re-pick", "delivered_at", "infinite", "never deleted", "still", "loop"],
+      "severity": "critical",
+      "category": "correctness"
+    },
+    {
+      "id": "B2_attempts_window_uses_created_at",
+      "file": "storage.py",
+      "function": "count_attempts_in_window",
+      "summary": "Filters by deliveries.created_at instead of an attempt timestamp, so once a burst is enqueued the count never decreases.",
+      "keywords": ["created_at", "attempts", "window", "rate", "never", "decrease", "burst", "stuck", "wrong"],
+      "severity": "high",
+      "category": "correctness"
+    },
+    {
+      "id": "B3_signing_not_constant_time",
+      "file": "signing.py",
+      "function": "verify",
+      "summary": "Comment claims constant-time comparison but uses `==`; should use hmac.compare_digest. Vulnerable to timing attacks.",
+      "keywords": ["constant", "time", "compare_digest", "hmac", "timing", "==", "side", "channel"],
+      "severity": "high",
+      "category": "security"
+    },
+    {
+      "id": "B4_parse_retry_after_dead_code",
+      "file": "http_client.py",
+      "function": "parse_retry_after",
+      "summary": "Function never returns anything but None because DeliveryResult exposes only response_body, not headers; Retry-After is therefore never honored.",
+      "keywords": ["Retry-After", "headers", "always", "None", "never", "honor", "stub"],
+      "severity": "medium",
+      "category": "correctness"
+    },
+    {
+      "id": "B5_dispatcher_non_retryable_condition",
+      "file": "dispatcher.py",
+      "function": "_try_one",
+      "summary": "Condition `if not is_retryable and attempts >= MAX_ATTEMPTS` requires both - so a 4xx (non-retryable) error is retried up to MAX_ATTEMPTS times instead of going to DLQ immediately.",
+      "keywords": ["non-retryable", "non_retryable", "MAX_ATTEMPTS", "4xx", "immediately", "DLQ", "dead_letter", "permanent", "and", "should be or"],
+      "severity": "high",
+      "category": "correctness"
+    },
+    {
+      "id": "B6_deliver_now_no_reschedule",
+      "file": "dispatcher.py",
+      "function": "deliver_now",
+      "summary": "On failure, records the attempt without setting next_scheduled_at; the row keeps scheduled_at == created_at and the dispatcher will re-attempt forever with no backoff.",
+      "keywords": ["next_scheduled_at", "reschedule", "backoff", "deliver_now", "test webhook", "loop", "no retry", "missing"],
+      "severity": "medium",
+      "category": "correctness"
+    },
+    {
+      "id": "B7_rate_limiter_lru_inverted",
+      "file": "rate_limiter.py",
+      "function": "allow",
+      "summary": "Newly-inserted buckets are not move_to_end'd, so they sit at the LRU front of the OrderedDict and are evicted first by popitem(last=False). LRU semantics are inverted for new entries.",
+      "keywords": ["move_to_end", "OrderedDict", "popitem", "LRU", "inverted", "new", "bucket", "eviction", "last=False"],
+      "severity": "medium",
+      "category": "correctness"
+    },
+    {
+      "id": "B8_metrics_histogram_not_cumulative",
+      "file": "metrics.py",
+      "function": "_Histogram.observe",
+      "summary": "Increments only the first bucket whose upper bound >= value (uses `if value <= b: counts[i] += 1` and then keeps looping but only matches once because of how it's structured); Prometheus histograms must be cumulative across all buckets >= value. Render code reads counts[i] not the running cumulative.",
+      "keywords": ["histogram", "cumulative", "buckets", "Prometheus", "le", "cumulative", "wrong"],
+      "severity": "medium",
+      "category": "correctness"
+    },
+    {
+      "id": "B9_api_delete_no_tenant_check",
+      "file": "api.py",
+      "function": "delete_subscription",
+      "summary": "No tenant-ownership check before deactivating; any authenticated tenant can deactivate any subscription if they know its UUID. Cross-tenant authorization bug.",
+      "keywords": ["tenant", "ownership", "delete", "deactivate", "authorization", "IDOR", "cross-tenant", "missing", "check"],
+      "severity": "critical",
+      "category": "security"
+    },
+    {
+      "id": "B10_api_get_delivery_no_tenant_check",
+      "file": "api.py",
+      "function": "get_delivery",
+      "summary": "No tenant-ownership check; an authenticated tenant can read any delivery's payload by guessing its UUID. Cross-tenant data leak.",
+      "keywords": ["tenant", "ownership", "delivery", "authorization", "IDOR", "cross-tenant", "leak", "payload", "missing"],
+      "severity": "critical",
+      "category": "security"
+    }
+  ]
+}

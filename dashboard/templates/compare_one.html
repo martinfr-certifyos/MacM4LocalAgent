@@ -1,0 +1,38 @@
+{% extends "_layout.html" %}
+{% block title %}Comparison #{{ r.id }}{% endblock %}
+{% block content %}
+  <h1>Comparison #{{ r.id }}</h1>
+  <p class="muted">{{ r.ts_human }} - judge score
+    <b>{{ "%.2f"|format(r.judge_score) }}</b></p>
+
+  <details open>
+    <summary>Prompt</summary>
+    <pre>{{ r.prompt }}</pre>
+  </details>
+
+  <section class="cards">
+    <div class="card">
+      <h3>local-long ({{ r.local_model }})</h3>
+      <div class="kv">
+        <span>Latency</span><b>{{ r.local_ms }} ms</b>
+        <span>Tokens in/out</span>
+        <b>{{ "{:,}".format(r.local_in_tok) }} / {{ "{:,}".format(r.local_out_tok) }}</b>
+        <span>Cost</span><b>$0.0000</b>
+      </div>
+      <pre class="output">{{ r.local_output }}</pre>
+    </div>
+
+    <div class="card">
+      <h3>claude-code ({{ r.claude_model }})</h3>
+      <div class="kv">
+        <span>Latency</span><b>{{ r.claude_ms }} ms</b>
+        <span>Tokens in/out</span>
+        <b>{{ "{:,}".format(r.claude_in_tok) }} / {{ "{:,}".format(r.claude_out_tok) }}</b>
+        <span>Cost</span><b>${{ "%.4f"|format(r.claude_cost) }}</b>
+      </div>
+      <pre class="output">{{ r.claude_output }}</pre>
+    </div>
+  </section>
+
+  <p class="muted"><a href="/compare">&larr; back to history</a></p>
+{% endblock %}

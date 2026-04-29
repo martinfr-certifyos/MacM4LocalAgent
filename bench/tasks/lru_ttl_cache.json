@@ -1,0 +1,34 @@
+{
+  "id": "lru_ttl_cache",
+  "title": "Thread-safe LRU + TTL cache with metrics and decorator",
+  "difficulty": "medium-hard",
+  "estimated_human_minutes": 60,
+  "description": "Implement a production-quality cache module that combines LRU eviction, per-key TTL, thread safety, and a decorator API. The model must produce a single self-contained Python file plus pass a fixed pytest suite.",
+  "deliverables": [
+    "Single Python module `lru_ttl_cache.py` with no third-party deps (stdlib only).",
+    "Class `LRUTTLCache(maxsize: int, default_ttl: float | None = None)` with: get/set/delete/clear/__len__/__contains__, per-entry ttl override on set(), thread-safe (RLock), correct LRU eviction touching get() too, lazy expiry on read AND active eviction when size limit hit, .stats() -> {hits, misses, evictions, expirations, size}.",
+    "Decorator `@memoize(maxsize=128, ttl=None)` that wraps any function (including ones with kwargs) and exposes .cache_info() and .cache_clear() like functools.lru_cache.",
+    "Module-level docstring explaining trade-offs (why OrderedDict, why RLock not Lock, time source choice, eviction order).",
+    "All public functions/classes type-annotated."
+  ],
+  "constraints": [
+    "Stdlib only (no `cachetools`, `cachebox`, etc.).",
+    "Must work on Python 3.11+.",
+    "No global state.",
+    "Time source must be injectable for testability (parameter `time_func: Callable[[], float] = time.monotonic`)."
+  ],
+  "prompt": "You are writing production Python code. Implement a thread-safe LRU + TTL cache and a memoize decorator in a single file `lru_ttl_cache.py` with stdlib only.\n\nRequirements:\n\n1. `class LRUTTLCache(maxsize: int, default_ttl: float | None = None, time_func: Callable[[], float] = time.monotonic)`\n   - `set(key, value, ttl: float | None = None)` - per-call ttl overrides default; ttl=None means never expire.\n   - `get(key, default=None)` - lazy expiry, updates LRU recency on hit.\n   - `delete(key) -> bool`, `clear() -> None`, `__len__`, `__contains__` (checks expiry).\n   - LRU eviction triggered when len > maxsize after set().\n   - `.stats() -> dict` with keys hits, misses, evictions, expirations, size.\n   - Thread-safe via `threading.RLock`.\n   - Use `collections.OrderedDict` for O(1) LRU.\n\n2. `def memoize(maxsize: int = 128, ttl: float | None = None)` decorator.\n   - Hashes (args, sorted kwargs.items()).\n   - Returns wrapped function with `.cache_info()` (namedtuple with hits, misses, maxsize, currsize) and `.cache_clear()`.\n   - Preserves __wrapped__, __name__, __doc__.\n\n3. Module docstring explaining design choices (>=80 words).\n\n4. Full type annotations.\n\nReturn ONLY the contents of `lru_ttl_cache.py` inside one ```python``` fenced block. No prose before or after.",
+  "grading": {
+    "extract": "first_python_fence",
+    "save_as": "lru_ttl_cache.py",
+    "test_file": "test_lru_ttl_cache.py",
+    "weights": {
+      "passes_tests": 0.70,
+      "syntactic_validity": 0.05,
+      "type_hints": 0.05,
+      "docstring": 0.05,
+      "no_third_party_imports": 0.10,
+      "stylistic": 0.05
+    }
+  }
+}

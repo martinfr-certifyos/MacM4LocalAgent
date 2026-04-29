@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{% block title %}M5 Hybrid Agent{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <strong>M5 Hybrid Agent</strong>
+      <span class="muted">Cursor &rarr; LiteLLM &rarr; (MLX | Ollama+TurboQuant | Claude)</span>
+    </div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/compare">A/B Compare</a>
+      <a href="/api/stats">JSON</a>
+    </nav>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer>
+    <span class="muted">All traffic logged in cost/cost.db. No external telemetry.</span>
+  </footer>
+</body>
+</html>

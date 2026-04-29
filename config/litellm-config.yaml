@@ -1,0 +1,45 @@
+model_list:
+  - model_name: local-fast
+    litellm_params:
+      # The upstream model id MUST match what mlx_lm.server exposes via
+      # /v1/models. We point at the Hugging Face id form because the absolute
+      # filesystem path form has slashes that confuse some clients.
+      model: openai/@@MLX_REPO@@
+      api_base: http://127.0.0.1:@@MLX_PORT@@/v1
+      api_key: not-needed
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: local-long
+    litellm_params:
+      model: ollama/@@OLLAMA_TAG@@
+      api_base: http://127.0.0.1:@@OLLAMA_PORT@@
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: claude-code
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+      # Validated at install time. Falls back to claude-sonnet-4-5 if 4-6 is unavailable.
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+
+  - model_name: hybrid-auto
+    # Magic alias: the size-based router rewrites `data["model"]` to one of
+    # the three real groups above before LiteLLM dispatches upstream, so the
+    # upstream params here are never actually used. We keep them harmless.
+    litellm_params:
+      model: openai/@@MLX_REPO@@
+      api_base: http://127.0.0.1:@@MLX_PORT@@/v1
+      api_key: not-needed
+
+litellm_settings:
+  drop_params: true
+  callbacks: ["router.route_by_size.proxy_handler_instance"]
+  success_callback: ["router.route_by_size.proxy_handler_instance"]
+  database_url: "sqlite:///./cost/cost.db"
+  set_verbose: false
+
+general_settings:
+  master_key: @@LITELLM_MASTER_KEY@@

@@ -1,0 +1,54 @@
+{% macro card(title, s) %}
+  <div class="card">
+    <h3>{{ title }}</h3>
+    <div class="kv">
+      <span>Requests</span><b>{{ "{:,}".format(s.total_requests) }}</b>
+      <span>Tokens in/out</span>
+      <b>{{ "{:,}".format(s.total_input_tokens) }} / {{ "{:,}".format(s.total_output_tokens) }}</b>
+      <span>Actual spend</span><b>${{ "%.2f"|format(s.actual_spend_usd) }}</b>
+      <span>Shadow spend</span><b>${{ "%.2f"|format(s.shadow_spend_usd) }}</b>
+      <span>Savings</span>
+      <b class="ok">${{ "%.2f"|format(s.savings_usd) }} ({{ "%.1f"|format(s.savings_pct) }}%)</b>
+    </div>
+    <div class="tiers">
+      {% for tier, info in s.by_tier.items() %}
+        <span class="tier tier-{{ tier }}">{{ tier }}: {{ "{:,}".format(info.requests) }}</span>
+      {% endfor %}
+    </div>
+  </div>
+{% endmacro %}
+
+<section class="cards">
+  {{ card("Today",         today)   }}
+  {{ card("Last 7 days",   week)    }}
+  {{ card("All time",      alltime) }}
+</section>
+
+<h2>Recent requests</h2>
+{% if recent %}
+<table>
+  <thead>
+    <tr>
+      <th>id</th><th>time</th><th>tier</th><th>model</th>
+      <th>in</th><th>out</th><th>$ actual</th><th>ms</th><th>reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in recent %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.ts_human }}</td>
+      <td><span class="tier tier-{{ r.tier }}">{{ r.tier }}</span></td>
+      <td><code>{{ r.model }}</code></td>
+      <td>{{ "{:,}".format(r.input_tok) }}</td>
+      <td>{{ "{:,}".format(r.output_tok) }}</td>
+      <td>${{ "%.4f"|format(r.actual_cost) }}</td>
+      <td>{{ r.latency_ms }}</td>
+      <td class="muted">{{ r.route_reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+  <p class="muted">No requests yet. Send a prompt through Cursor or run <code>make compare PROMPT="..."</code>.</p>
+{% endif %}

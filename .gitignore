@@ -1,0 +1,52 @@
+# Virtual environments
+.venvs/
+.venv/
+venv/
+env/
+
+# Models (large binary artifacts; download separately)
+models/
+
+# Logs and run artifacts
+.logs/
+logs/
+*.log
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+
+# Experimental / scratch
+.experimental/
+
+# Benchmark run artifacts (regenerated per run)
+bench/results/
+
+# Runtime databases
+cost/cost.db
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Secrets / env
+.env
+.env.local
+*.secret

@@ -1,0 +1,14 @@
+{% extends "_layout.html" %}
+{% block title %}Dashboard - M5 Hybrid Agent{% endblock %}
+{% block content %}
+  <h1>Cost &amp; routing</h1>
+  <p class="muted">
+    Live snapshot of LiteLLM-proxied traffic. Local requests are free; the
+    "shadow spend" column shows what the same tokens would have cost on Claude
+    Sonnet 4.6 ($3 / $15 per 1M).
+  </p>
+
+  <div id="stats" hx-get="/stats" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    <p class="muted">loading...</p>
+  </div>
+{% endblock %}

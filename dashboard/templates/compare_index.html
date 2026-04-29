@@ -1,0 +1,43 @@
+{% extends "_layout.html" %}
+{% block title %}A/B Compare - M5 Hybrid Agent{% endblock %}
+{% block content %}
+  <h1>A/B Compare local vs Claude</h1>
+  <p class="muted">
+    Sends the same prompt through <code>local-long</code> (Ollama + TurboQuant)
+    and <code>claude-code</code>. Stores both outputs, latencies, token counts,
+    and a simple length+structure judge score.
+  </p>
+
+  <form method="post" action="/compare/run" class="compose">
+    <textarea name="prompt" rows="6" placeholder="Paste a prompt here..." required></textarea>
+    <button type="submit">Run comparison</button>
+  </form>
+
+  <h2>History</h2>
+  {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>id</th><th>time</th><th>prompt</th>
+          <th>local ms</th><th>claude ms</th>
+          <th>$ claude</th><th>judge</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+          <tr>
+            <td><a href="/compare/{{ r.id }}">{{ r.id }}</a></td>
+            <td>{{ r.ts_human }}</td>
+            <td><code>{{ r.prompt_short }}</code></td>
+            <td>{{ r.local_ms }}</td>
+            <td>{{ r.claude_ms }}</td>
+            <td>${{ "%.4f"|format(r.claude_cost) }}</td>
+            <td>{{ "%.2f"|format(r.judge_score) }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No comparisons yet.</p>
+  {% endif %}
+{% endblock %}

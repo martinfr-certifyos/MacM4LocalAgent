@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>          <string>com.local.litellm</string>
+  <key>RunAtLoad</key>      <true/>
+  <key>KeepAlive</key>      <true/>
+  <key>WorkingDirectory</key><string>@@REPO_ROOT@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>      <string>@@REPO_ROOT@@/.venvs/litellm/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONPATH</key><string>@@REPO_ROOT@@</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@REPO_ROOT@@/.venvs/litellm/bin/python</string>
+    <string>@@REPO_ROOT@@/scripts/run_litellm.py</string>
+    <string>--config</string><string>@@REPO_ROOT@@/config/litellm-config.rendered.yaml</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>4000</string>
+  </array>
+  <key>StandardOutPath</key><string>@@REPO_ROOT@@/.logs/litellm.out.log</string>
+  <key>StandardErrorPath</key><string>@@REPO_ROOT@@/.logs/litellm.err.log</string>
+</dict>
+</plist>
