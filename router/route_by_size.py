@@ -16,9 +16,11 @@ alias defined in litellm-config.yaml.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import sys
 import time
@@ -29,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from router.complexity_classifier import classify  # noqa: E402
 from router.overgeneration_control import (  # noqa: E402
+    _looks_like_cline,
     apply_multi_turn_tighten,
     apply_static_guardrail,
 )
@@ -227,6 +230,219 @@ def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, in
     return ("local-fast", f"tokens {tokens} <= {ROUTE_FAST_MAX}", tokens)
 
 
+# ----- Cline-aware routing --------------------------------------------------
+#
+# Why this exists:
+# Cline ships a ~13.5K-token system prompt encoding its tool catalogue as
+# XML. That alone clears `ROUTE_FAST_MAX` (16K), so the size-based
+# `decide_tier()` would always pick `local-long` (or claude-code for
+# >128K) regardless of how trivial the user's actual task is. Worse,
+# the complexity classifier scans the FLAT prompt, and Cline's
+# system prompt happens to contain phrases like "[local development]"
+# that match our `[local]` opt-out tag -- so today's behaviour is
+# "Cline always routes to local-fast because the harness accidentally
+# matches the local-tag regex" -- exactly wrong.
+#
+# The Cline-aware path:
+#   1. Detects Cline traffic via the existing fingerprint
+#      (`_looks_like_cline`).
+#   2. Extracts the user's actual task from `<task>...</task>` envelope.
+#      That's literally the only text Cline-the-extension-host wraps
+#      around the user's prompt.
+#   3. Classifies on the extracted task ONLY -- the harness can't
+#      drown the signal.
+#   4. Defaults to `local-long` (NEVER `local-fast` -- structurally
+#      unreachable from Cline because of harness size).
+#   5. Escalates to `claude-code` on:
+#        a. Explicit `[claude]` tag in the task.
+#        b. Architecture / multi-file / deep-reasoning keywords.
+#        c. Hairy-debugging signal in the LATEST tool result
+#           (Python `Traceback`, JS stack, Rust panic, > 3 `error:`
+#            lines). Big file dumps are NOT a signal -- those are
+#           Cline's normal `environment_details` payload, not a real
+#           failure.
+#   6. Stickiness: once a task fingerprint has escalated to claude
+#      this session, every subsequent turn from the same task stays
+#      on claude. Prevents flapping; max one escalation per task. The
+#      fingerprint is a SHA256 of the normalized `<task>...</task>`
+#      text and it lives in a TTL'd in-memory dict (proxy restart
+#      wipes it -- acceptable, the next first-turn re-classifies
+#      anyway).
+
+_CLINE_TASK_RE = re.compile(r"<task>\s*(.*?)\s*</task>", re.DOTALL | re.IGNORECASE)
+
+# Latest-tool-result error signatures. Match a Python traceback frame,
+# a JS stack-frame `at func (...)`, a Rust panic banner, or 3+ lines
+# starting with `error:` / `Error:` / `ERROR:` regardless of language.
+_PY_TRACEBACK_RE = re.compile(r"^\s*Traceback \(most recent call last\)", re.MULTILINE)
+_JS_STACK_RE = re.compile(r"^\s+at\s+\S+\s+\(", re.MULTILINE)
+_RUST_PANIC_RE = re.compile(r"thread '.+?' panicked at", re.IGNORECASE)
+_GENERIC_ERROR_LINE_RE = re.compile(r"^\s*(error|Error|ERROR):\s", re.MULTILINE)
+
+# Sticky escalation tracker. Maps task-fingerprint -> (timestamp, reason).
+# Entries older than _STICKY_TTL_SECONDS are evicted on read; we only
+# clean opportunistically to keep this lock-free. Memory bound: a
+# session ~40 tasks * 80 bytes/entry ~= 3 KB; not worth tuning.
+_STICKY_TTL_SECONDS = 30 * 60  # 30 min: covers a typical Cline session
+_sticky_escalations: dict[str, tuple[float, str]] = {}
+
+
+def _extract_user_task(messages: Iterable[dict[str, Any]] | None) -> str | None:
+    """For Cline-shaped requests, return the text inside the FIRST
+    `<task>...</task>` envelope. None otherwise -- caller falls back
+    to legacy size-based routing.
+    """
+    if not messages:
+        return None
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "\n".join(
+                p.get("text", "") for p in c if isinstance(p, dict)
+            )
+        if not isinstance(c, str):
+            continue
+        match = _CLINE_TASK_RE.search(c)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _latest_tool_result_text(messages: Iterable[dict[str, Any]] | None) -> str:
+    """Return the content of the trailing user message (Cline's
+    tool-result envelope), or empty string if none. We deliberately
+    look only at the LATEST message, not the whole history, so that
+    a single early failure doesn't keep escalating turns later in
+    the same task.
+    """
+    if not messages:
+        return ""
+    msgs = list(messages)
+    if not msgs:
+        return ""
+    last = msgs[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return ""
+    c = last.get("content")
+    if isinstance(c, list):
+        return "\n".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return c if isinstance(c, str) else ""
+
+
+def _looks_like_failure(text: str) -> tuple[bool, str]:
+    """Return (is_failure, reason). Conservative: requires a clear
+    runtime-error signature, not just a big text blob. Cline's normal
+    `environment_details` block is several KB on its own and we do
+    NOT want to escalate on size alone."""
+    if not text:
+        return (False, "")
+    if _PY_TRACEBACK_RE.search(text):
+        return (True, "python traceback in tool result")
+    if _RUST_PANIC_RE.search(text):
+        return (True, "rust panic in tool result")
+    js_hits = len(_JS_STACK_RE.findall(text))
+    if js_hits >= 2:
+        return (True, f"js stack ({js_hits} frames) in tool result")
+    err_hits = len(_GENERIC_ERROR_LINE_RE.findall(text))
+    if err_hits >= 3:
+        return (True, f"{err_hits} error: lines in tool result")
+    return (False, "")
+
+
+def _task_fingerprint(task: str) -> str:
+    """SHA256 of the normalized task text. Whitespace-collapse so that
+    Cline's idiosyncratic indentation in the <task> envelope doesn't
+    cause false-misses on the second turn."""
+    norm = " ".join(task.split())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def _check_sticky(fingerprint: str) -> str | None:
+    """If the given task is already on the sticky-escalated list and
+    the entry is still fresh, return the original reason; else None.
+    Opportunistically evicts expired entries on each read."""
+    now = time.time()
+    expired = [k for k, (ts, _) in _sticky_escalations.items() if now - ts > _STICKY_TTL_SECONDS]
+    for k in expired:
+        _sticky_escalations.pop(k, None)
+    entry = _sticky_escalations.get(fingerprint)
+    if entry is None:
+        return None
+    return entry[1]
+
+
+def _mark_sticky(fingerprint: str, reason: str) -> None:
+    _sticky_escalations[fingerprint] = (time.time(), reason)
+
+
+def decide_tier_cline(
+    messages: Iterable[dict[str, Any]] | None,
+) -> tuple[str, str, int]:
+    """Cline-aware tier decision. Returns (model, reason, task_tokens).
+
+    The third element is an APPROXIMATE token count of the user's
+    extracted task -- NOT the full request -- because routing is by
+    task complexity, not harness size. Useful for cost-attribution
+    in the request log: "this turn billed against a 12-token task".
+    """
+    task = _extract_user_task(messages)
+    if task is None:
+        # Should not happen -- caller already verified _looks_like_cline.
+        # Fall back safely.
+        return decide_tier(messages)
+
+    task_tokens = max(1, len(task) // 4)
+    fingerprint = _task_fingerprint(task)
+
+    sticky_reason = _check_sticky(fingerprint)
+    if sticky_reason is not None:
+        return (
+            "claude-code",
+            f"cline+sticky({fingerprint}): {sticky_reason}",
+            task_tokens,
+        )
+
+    is_complex, why = classify(task)
+    # `[local]` opt-out wins over EVERYTHING, including tool-result
+    # failure detection. If the user wrote `[local]`, they want a
+    # local model even on hard tasks or repeated failures -- they're
+    # deliberately exercising the local stack and don't want the
+    # proxy quietly escalating spend behind their back.
+    if why == "explicit [local] tag":
+        return (
+            "local-long",
+            "cline+override: explicit [local] tag",
+            task_tokens,
+        )
+    if is_complex:
+        _mark_sticky(fingerprint, why)
+        return ("claude-code", f"cline+task({fingerprint}): {why}", task_tokens)
+
+    # Tool-result-driven escalation. Only fires on turns 2+ since
+    # turn-1 has no tool result yet. Marked sticky -- a single
+    # error trace usually means the rest of the task will also be
+    # debug-heavy, and we don't want claude pricing on the SAME
+    # task to keep flapping back to local just because turn-N+1's
+    # tool result happens to be clean.
+    msg_count = len(list(messages or []))
+    if msg_count >= 4:  # system + task + asst + tool_result(s)
+        tool_text = _latest_tool_result_text(messages)
+        is_failure, fail_reason = _looks_like_failure(tool_text)
+        if is_failure:
+            _mark_sticky(fingerprint, fail_reason)
+            return (
+                "claude-code",
+                f"cline+turn({fingerprint}): {fail_reason}",
+                task_tokens,
+            )
+
+    # Default: local-long. Cline's harness alone is too big for
+    # local-fast, so we never pick that for Cline traffic.
+    return ("local-long", f"cline+default: task={task_tokens} tok", task_tokens)
+
+
 # ----- LiteLLM callback shim ------------------------------------------------
 #
 # LiteLLM looks for a class with `async_pre_call_hook` and/or `log_success_event`.
@@ -279,9 +495,17 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 requested = canonical
 
             if requested == "hybrid-auto":
-                model, reason, tokens = decide_tier(data.get("messages"))
+                msgs = data.get("messages")
+                # Cline traffic uses the task-aware path; other clients
+                # (CLI, raw curl, benchmarks) keep the legacy size-based
+                # logic. Detected via the same fingerprint that drives
+                # over-generation control, so the two stay aligned.
+                if _looks_like_cline(msgs):
+                    model, reason, tokens = decide_tier_cline(msgs)
+                    reason = f"cline-mode: {reason}"
+                else:
+                    model, reason, tokens = decide_tier(msgs)
                 data["model"] = model
-                # Stash routing metadata for the success callback.
                 meta = data.setdefault("metadata", {})
                 meta["route_decision"] = model
                 meta["route_reason"] = reason
@@ -405,8 +629,20 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             except Exception:
                 latency_ms = 0
 
-        meta = kwargs.get("metadata", {}) or {}
-        reason = meta.get("route_reason", "")
+        # LiteLLM relocates the metadata we set in async_pre_call_hook
+        # into kwargs["litellm_params"]["metadata"] by the time it
+        # reaches the success callback. The top-level kwargs["metadata"]
+        # is also valid in some lifecycle paths, so we check both --
+        # litellm_params first because that's where Cline-aware routing
+        # decisions actually land.
+        litellm_params = kwargs.get("litellm_params") or {}
+        nested_meta = litellm_params.get("metadata") or {}
+        top_meta = kwargs.get("metadata") or {}
+        reason = (
+            nested_meta.get("route_reason")
+            or top_meta.get("route_reason")
+            or ""
+        )
 
         self._conn.execute(
             """

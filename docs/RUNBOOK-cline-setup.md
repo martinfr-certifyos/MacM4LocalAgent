@@ -373,7 +373,104 @@ mis-reports.
 
 ---
 
-## 7. What we lose vs. native Cursor agent mode
+## 8. Cline-aware dynamic routing (`gpt-hybrid-auto`)
+
+If you want one Model ID in Cline that automatically picks the
+right backend per turn, configure Cline against `gpt-hybrid-auto`
+instead of the static `gpt-local-long`. The proxy will detect
+Cline traffic and route each turn based on the user's task,
+defaulting to local but escalating to Claude when it's clearly
+warranted.
+
+### 8.1 Why a Cline-specific path
+
+The size-based router that handles non-Cline traffic uses the
+total prompt size to pick a tier (`local-fast` ≤ 16K tokens,
+`local-long` 16K–128K, `claude-code` > 128K). Cline doesn't fit
+that model:
+
+- Cline's system prompt is ~13.5K tokens (the full XML tool
+  catalogue is encoded in the prompt). Every turn is structurally
+  in the 16K–128K range — `local-fast` is **unreachable** from
+  Cline.
+- The complexity classifier scans the flat prompt for keywords.
+  Cline's system prompt mentions phrases like "[local] development"
+  and "the local environment" inside its tool docs, which would
+  match the `[local]` opt-out tag and incorrectly route every
+  turn to local-fast.
+
+So the router needs to extract the user's actual task from
+Cline's `<task>...</task>` envelope and classify on **that
+text only**.
+
+### 8.2 Routing rules for Cline traffic
+
+| Source | Trigger | Result |
+| --- | --- | --- |
+| Original task: `[claude] ...` | Always | claude-code |
+| Original task: `[local] ...` | Always (overrides everything) | local-long |
+| Original task: architecture / multi-file / deep-reasoning keywords | First turn | claude-code (sticky) |
+| Latest tool result: Python `Traceback` / Rust panic / 2+ JS stack frames / 3+ `error:` lines | Turn 2+ | claude-code (sticky) |
+| Latest tool result: just a big file dump | Any turn | local-long (no escalation) |
+| Default | Any turn | local-long |
+
+**Stickiness:** once a task is escalated to Claude (by complexity
+or failure), every subsequent turn of the **same task** stays on
+Claude even if the later turn looks trivial. Tasks are
+fingerprinted by a SHA256 of the normalized `<task>` text and
+the tracker has a 30-minute TTL. Restarting the proxy clears it,
+which is fine — the next first-turn re-classifies anyway.
+
+The `[local]` opt-out is intentionally absolute. If you write
+`[local]`, the proxy will never escalate that task to Claude
+even on a Python traceback. This protects users who deliberately
+want to exercise the local stack from silent cost increases.
+
+### 8.3 Verifying routing decisions in `cost.db`
+
+Every routed request lands in `cost/cost.db` with the route
+reason recorded. Cline-mode rows are prefixed with `cline-mode:`
+so you can filter:
+
+```bash
+sqlite3 cost/cost.db "
+  SELECT datetime(ts, 'unixepoch','localtime') AS time,
+         tier, model, route_reason
+  FROM requests
+  WHERE route_reason LIKE 'cline-mode:%'
+  ORDER BY ts DESC LIMIT 10
+"
+```
+
+Sample output during a 4-prompt regression test:
+
+```
+2026-05-01 13:23:38|local-long|qwen3-coder-next:q4_K_M|cline-mode: cline+override: explicit [local] tag
+2026-05-01 13:23:35|claude    |claude-sonnet-4-6      |cline-mode: cline+task(3f4b25ace2f6e1db): explicit [claude] tag
+2026-05-01 13:23:34|claude    |claude-sonnet-4-6      |cline-mode: cline+task(f934912df54d8239): architecture/design language
+2026-05-01 13:23:32|local-long|qwen3-coder-next:q4_K_M|cline-mode: cline+default: task=8 tok
+```
+
+### 8.4 Do you still need `local-fast`?
+
+For Cline: **no.** The MLX model is structurally unreachable
+from Cline traffic and the router never picks it. The
+`gpt-local-fast` alias remains in the config for non-Cline
+callers (CLI, raw `curl`, the benchmark harness) where small
+prompts still benefit from the lower-latency 7B model. Removing
+it would break those paths without helping Cline at all.
+
+### 8.5 When NOT to use `gpt-hybrid-auto`
+
+| Use this instead | When |
+| --- | --- |
+| `gpt-local-long` | You want strict local-only execution and no surprise Claude charges, even on debugging-heavy tasks. |
+| `gpt-claude-code` | You want every turn on Claude (e.g. evaluating a critical refactor where local-quality is unacceptable). |
+| `gpt-hybrid-auto` | Default for normal Cline use. Cheap by default, smart enough to escalate when needed. |
+
+---
+
+## 9. What we lose vs. native Cursor agent mode
 
 - No Cursor "checkpoints" (Cline has its own task history but it's
   not file-system-snapshot-based the way Cursor's is).
@@ -383,7 +480,7 @@ mis-reports.
 
 ---
 
-## 8. What we gain
+## 10. What we gain
 
 - Local model drives a real agent loop with rendered tool steps.
 - Zero per-token cost when running on `gpt-local-agent` /
@@ -396,7 +493,7 @@ mis-reports.
 
 ---
 
-## 9. Reverting
+## 11. Reverting
 
 ```bash
 /Applications/Cursor.app/Contents/Resources/app/bin/cursor \
