@@ -159,12 +159,49 @@ log "GGUF on disk: $GGUF_PATH (${GGUF_GB} GB)"
 # Build a Modelfile that points Ollama at the GGUF and sets the long-context
 # parameters we need. The KV cache type comes from the daemon's launchd env
 # (OLLAMA_KV_CACHE_TYPE=tq3) so we don't need to set it here.
+#
+# The TEMPLATE block matters: bartowski's GGUF for Qwen3-Coder-Next ships
+# WITHOUT a chat template baked in, and Ollama's default fallback when no
+# TEMPLATE is set is `{{ .Prompt }}` (raw passthrough, no role markers).
+# When LiteLLM forwards OpenAI-shaped role messages through Ollama under
+# that empty template, Ollama crudely serializes them as
+# `### User: ... ### Assistant: ...` markdown headers. The model is
+# trained on canonical ChatML (`<|im_start|>role\n...<|im_end|>\n`), so
+# it sees the markdown-header form as out-of-distribution and tends to
+# hallucinate `### User:` continuations mid-response (observed in Cline
+# turn-3: 359 output tokens with fake "### Assistant:" preamble and
+# fake completion). Setting the canonical Qwen3 ChatML template here
+# fixes that at the source: Cline turn-3 drops from 359 -> 93 tokens
+# and the hallucinated role-markers disappear.
+#
+# The eos token for Qwen3 is <|im_end|>; we add it as a stop parameter
+# so the model halts cleanly at the end of an assistant turn even if
+# the client doesn't pass its own stop list.
 MODELFILE="$TARGET_DIR/Modelfile"
-cat > "$MODELFILE" <<EOF
-FROM $GGUF_PATH
-PARAMETER num_ctx ${LOCAL_LONG_CTX:-131072}
+cat > "$MODELFILE" <<'MODELFILE_EOF'
+FROM __GGUF_PATH__
+TEMPLATE """{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- end }}
+<|im_start|>assistant
+"""
+PARAMETER num_ctx __LOCAL_LONG_CTX__
 PARAMETER num_predict 8192
-EOF
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
+MODELFILE_EOF
+sed -i.bak \
+    -e "s|__GGUF_PATH__|$GGUF_PATH|" \
+    -e "s|__LOCAL_LONG_CTX__|${LOCAL_LONG_CTX:-131072}|" \
+    "$MODELFILE"
+rm -f "${MODELFILE}.bak"
 
 log "Modelfile:"
 sed 's/^/    /' "$MODELFILE" | tee -a "$LOG"

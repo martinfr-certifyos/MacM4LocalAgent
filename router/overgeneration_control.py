@@ -57,6 +57,26 @@ LOCAL_MAX_TOKENS_FIXUP = 3072
 # usually accept up to 4 stop sequences.
 LOCAL_STOP_SEQUENCES = ["\n```python:", "\n```py:"]
 
+# Cline-specific stop sequences. Cline encodes its tool catalogue as
+# XML inside the system prompt and expects exactly ONE tool call per
+# assistant turn. Without these stops, even Qwen3-Coder-Next will
+# happily continue past `</replace_in_file>` and hallucinate the rest
+# of a multi-turn conversation (`### User:`, fake tool results, fake
+# <attempt_completion>) inside a single response. Cline parses only
+# the FIRST tool tag, so the hallucinated continuation either confuses
+# the harness or wastes tokens and wall time.
+#
+# OpenAI/LiteLLM/Ollama accept up to 4 stop sequences reliably, so we
+# pick the four most common Cline tool-close tags. The remaining tools
+# (search_files, list_files, etc.) are rarer and a runaway is acceptable
+# for them while we keep within the per-request stop budget.
+CLINE_STOP_SEQUENCES = [
+    "</replace_in_file>",
+    "</write_to_file>",
+    "</read_file>",
+    "</attempt_completion>",
+]
+
 LOCAL_SYSTEM_NUDGE = (
     "You are running on a local Apple-Silicon model with a hard output "
     "budget. When asked to fix or modify code, emit ONLY the minimal "
@@ -100,6 +120,37 @@ def _is_local(model: str | None) -> bool:
     if "claude" in m or "anthropic" in m:
         return False
     return any(tok.lower() in m for tok in LOCAL_MODEL_TOKENS)
+
+
+# Substrings that uniquely identify a Cline-shaped request. We look at
+# the system prompt because Cline's harness embeds its full XML tool
+# catalogue there and uses a stable, distinctive opening line. Matching
+# on the system prompt lets us turn on Cline-specific behavior
+# regardless of which model alias the user picked, and without false
+# positives on benchmark traffic that just happens to use the same
+# model.
+_CLINE_SYSTEM_FINGERPRINTS = (
+    "You are Cline,",
+    "<replace_in_file>",
+    "<attempt_completion>",
+)
+
+
+def _looks_like_cline(messages: Any) -> bool:
+    """Return True if the request shape matches Cline's harness.
+
+    Cheap O(1) string scan over the first system-role message. Returns
+    False for any non-list / empty / non-Cline input.
+    """
+    if not isinstance(messages, list) or not messages:
+        return False
+    first = messages[0]
+    if not isinstance(first, dict) or first.get("role") != "system":
+        return False
+    text = _content_text(first.get("content"))
+    if not text:
+        return False
+    return any(fp in text for fp in _CLINE_SYSTEM_FINGERPRINTS)
 
 
 def _content_text(content: Any) -> str:
@@ -166,8 +217,14 @@ def apply_static_guardrail(
         we leave it alone. Otherwise we clamp.
       - We extend `stop` rather than replace it, so callers can add
         their own stop sequences.
+      - For Cline-shaped traffic (detected via system-prompt
+        fingerprint) we swap the python-fence stops for the Cline
+        tool-close-tag stops -- the python-fence stops are useless to
+        Cline and the tool-close stops prevent the model from
+        hallucinating a multi-turn conversation in one response.
       - The system nudge is prepended only if there is no existing
-        system message.
+        system message. Cline already has a ~13K-token system prompt
+        of its own, so we don't add ours on top of that.
     """
     try:
         if only_for_local and not _is_local(data.get("model")):
@@ -178,8 +235,16 @@ def apply_static_guardrail(
         if existing_max is None or int(existing_max) > max_tokens:
             data["max_tokens"] = int(max_tokens)
 
-        # Extend stop sequences.
-        seqs = list(stop_sequences) if stop_sequences is not None else list(LOCAL_STOP_SEQUENCES)
+        is_cline = _looks_like_cline(data.get("messages"))
+
+        # Extend stop sequences. Cline traffic gets the tool-close-tag
+        # set; everything else gets the python-fence default.
+        if stop_sequences is not None:
+            seqs = list(stop_sequences)
+        elif is_cline:
+            seqs = list(CLINE_STOP_SEQUENCES)
+        else:
+            seqs = list(LOCAL_STOP_SEQUENCES)
         existing_stop = data.get("stop")
         if isinstance(existing_stop, str):
             existing_stop = [existing_stop]
@@ -195,8 +260,10 @@ def apply_static_guardrail(
         if merged_stop:
             data["stop"] = merged_stop[:4]
 
-        # Prepend a system message if none present.
-        if system_nudge:
+        # Prepend a system message if none present. Cline already has
+        # a sizable system prompt of its own; injecting ours on top
+        # would only confuse the agent harness.
+        if system_nudge and not is_cline:
             messages = data.get("messages") or []
             if not any(
                 isinstance(m, dict) and m.get("role") == "system"
@@ -225,12 +292,19 @@ def apply_multi_turn_tighten(
       - clamps max_tokens to a smaller ceiling
       - appends a brief reminder to the LAST user message (not as a new
         message, so the cache prefix stays maximally reusable)
-    No effect on single-turn requests or non-local models.
+    No effect on single-turn requests or non-local models. Cline
+    traffic is also exempted: its harness expects a strict
+    role/content shape, and silently appending a nudge to the user
+    message can be parsed as part of the tool-result envelope and
+    confuse the model. The static guardrail's stop-sequence swap is
+    enough to fix Cline over-generation on its own.
     """
     try:
         if only_for_local and not _is_local(data.get("model")):
             return data
         messages = data.get("messages") or []
+        if _looks_like_cline(messages):
+            return data
         if not _looks_like_fixup_turn(messages):
             return data
 

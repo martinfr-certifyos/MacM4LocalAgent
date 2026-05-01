@@ -82,6 +82,7 @@ def _replay_one(
     base_url: str,
     api_key: str,
     timeout: float,
+    stop: list[str] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -91,6 +92,8 @@ def _replay_one(
         # no max_tokens (let the over-gen control clamp it), low temp for repeatability.
         "temperature": 0.2,
     }
+    if stop:
+        payload["stop"] = stop
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -124,6 +127,7 @@ def _replay_one(
         "content_chars": len(content),
         "content_head": content[:400],
         "content_tail": content[-200:] if len(content) > 600 else "",
+        "content_full": content,
     }
 
 
@@ -143,7 +147,40 @@ def main() -> int:
     )
     ap.add_argument("--base-url", default="http://127.0.0.1:4000")
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument(
+        "--stop",
+        default=None,
+        help=(
+            "comma-separated list of stop strings to pass to the model. "
+            "Useful for verifying that adding `stop=['</read_file>', "
+            "'</replace_in_file>', '</attempt_completion>', ...]` makes "
+            "the model emit exactly one tool tag per response. "
+            "Pass the literal string 'cline' as a shortcut for the full "
+            "Cline tool-close-tag list."
+        ),
+    )
     args = ap.parse_args()
+
+    stop_list: list[str] | None = None
+    if args.stop:
+        if args.stop.strip().lower() == "cline":
+            stop_list = [
+                "</read_file>",
+                "</write_to_file>",
+                "</replace_in_file>",
+                "</list_files>",
+                "</search_files>",
+                "</execute_command>",
+                "</attempt_completion>",
+                "</ask_followup_question>",
+                "</new_task>",
+                "</use_mcp_tool>",
+                "</access_mcp_resource>",
+                "</plan_mode_respond>",
+                "</load_mcp_documentation>",
+            ]
+        else:
+            stop_list = [s for s in args.stop.split(",") if s]
 
     dump_path = pathlib.Path(args.dump)
     if not dump_path.is_absolute():
@@ -162,10 +199,12 @@ def main() -> int:
     print()
 
     api_key = _master_key()
+    if stop_list:
+        print(f"  stop:        {len(stop_list)} sequence(s) passed (e.g. {stop_list[0]!r})")
     rows: list[dict[str, Any]] = []
     for model in [m.strip() for m in args.models.split(",") if m.strip()]:
         print(f"  >>> replaying with model={model} ...", flush=True)
-        row = _replay_one(model, messages, args.base_url, api_key, args.timeout)
+        row = _replay_one(model, messages, args.base_url, api_key, args.timeout, stop=stop_list)
         rows.append(row)
         if "error" in row:
             print(f"      ERROR after {row['wall_seconds']:.2f}s: {row['error']}")

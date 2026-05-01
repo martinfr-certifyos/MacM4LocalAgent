@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from router.overgeneration_control import (
+    CLINE_STOP_SEQUENCES,
     LOCAL_FIXUP_NUDGE,
     LOCAL_MAX_TOKENS_DEFAULT,
     LOCAL_MAX_TOKENS_FIXUP,
@@ -21,6 +22,7 @@ from router.overgeneration_control import (
     apply_multi_turn_tighten,
     apply_static_guardrail,
     _is_local,
+    _looks_like_cline,
     _looks_like_fixup_turn,
 )
 
@@ -277,3 +279,153 @@ def test_apply_all_does_not_raise_on_garbage_input() -> None:
     apply_all({"model": "local-long", "messages": [{"role": "user"}]})
     apply_all({"model": "local-long",
                "messages": [{"role": "user", "content": 12345}]})
+
+
+# ---------- Cline-shape detection ----------------------------------------
+
+def _cline_messages(*, with_replace_in_file: bool = True) -> list[dict[str, Any]]:
+    """A minimal fixture that mimics Cline's harness shape.
+
+    The detector keys off two stable substrings in the system prompt:
+    'You are Cline,' and the XML tool-tag descriptors. We include the
+    `<replace_in_file>` tag in the system prompt by default since it
+    is what triggered the original bug we're guarding against.
+    """
+    sysprompt_parts = ["You are Cline, a highly skilled software engineer."]
+    if with_replace_in_file:
+        sysprompt_parts.append(
+            "Use <replace_in_file>...</replace_in_file> to modify files."
+        )
+    return [
+        {"role": "system", "content": " ".join(sysprompt_parts)},
+        {"role": "user", "content": "<task>Append a line to spec.txt</task>"},
+    ]
+
+
+def test_looks_like_cline_detects_stable_fingerprints() -> None:
+    assert _looks_like_cline(_cline_messages()) is True
+
+
+def test_looks_like_cline_handles_list_content_form() -> None:
+    msgs = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "You are Cline, expert engineer."},
+                {"type": "text", "text": "<replace_in_file>...</replace_in_file>"},
+            ],
+        },
+        {"role": "user", "content": "do a thing"},
+    ]
+    assert _looks_like_cline(msgs) is True
+
+
+def test_looks_like_cline_returns_false_for_non_cline() -> None:
+    assert _looks_like_cline(None) is False
+    assert _looks_like_cline([]) is False
+    assert _looks_like_cline([{"role": "user", "content": "hi"}]) is False
+    assert _looks_like_cline([{"role": "system", "content": "Be helpful."}]) is False
+    # No system message, just a user message that mentions Cline tags.
+    assert _looks_like_cline(
+        [{"role": "user", "content": "<replace_in_file>x</replace_in_file>"}]
+    ) is False
+
+
+# ---------- Cline-specific stop-sequence swap ----------------------------
+
+def test_static_guardrail_uses_cline_stops_for_cline_traffic() -> None:
+    data = {"model": "local-long", "messages": _cline_messages()}
+    apply_static_guardrail(data)
+    stops = data.get("stop") or []
+    # Cline tag stops should be present, not the python-fence stops.
+    assert "</replace_in_file>" in stops
+    assert "</attempt_completion>" in stops
+    assert "\n```python:" not in stops
+    assert "\n```py:" not in stops
+
+
+def test_static_guardrail_uses_python_fence_stops_for_non_cline_local() -> None:
+    data = {
+        "model": "local-long",
+        "messages": [{"role": "user", "content": "Refactor my function"}],
+    }
+    apply_static_guardrail(data)
+    stops = data.get("stop") or []
+    assert "\n```python:" in stops
+    assert "</replace_in_file>" not in stops
+
+
+def test_static_guardrail_does_not_inject_system_nudge_for_cline() -> None:
+    """Cline already ships a ~13K-token system prompt of its own; adding
+    ours on top is at best wasted tokens and at worst confuses the
+    harness's tool-parsing rules."""
+    data = {"model": "local-long", "messages": _cline_messages()}
+    n_msgs_before = len(data["messages"])
+    apply_static_guardrail(data)
+    assert len(data["messages"]) == n_msgs_before
+    # The Cline system prompt must still be at index 0 untouched.
+    assert "You are Cline," in data["messages"][0]["content"]
+    # And our nudge must NOT have been concatenated either.
+    assert LOCAL_SYSTEM_NUDGE not in data["messages"][0]["content"]
+
+
+def test_static_guardrail_still_caps_max_tokens_for_cline() -> None:
+    data = {"model": "local-long", "messages": _cline_messages()}
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == LOCAL_MAX_TOKENS_DEFAULT
+
+
+def test_static_guardrail_explicit_stop_sequences_override_cline_default() -> None:
+    """Caller-provided stop_sequences win; the Cline auto-swap only
+    applies when the caller passed None (i.e. trusted us to pick)."""
+    data = {"model": "local-long", "messages": _cline_messages()}
+    apply_static_guardrail(data, stop_sequences=["END"])
+    assert data["stop"] == ["END"]
+
+
+def test_static_guardrail_caller_extends_stops_for_cline() -> None:
+    """If the caller already supplied a `stop` list (e.g. Cline itself
+    via the API request), the existing entries are kept and our Cline
+    stops are appended -- both up to the 4-stop cap."""
+    data = {
+        "model": "local-long",
+        "messages": _cline_messages(),
+        "stop": ["</read_file>"],
+    }
+    apply_static_guardrail(data)
+    stops = data["stop"]
+    assert stops[0] == "</read_file>"  # original first
+    assert "</replace_in_file>" in stops
+    assert len(stops) <= 4
+
+
+def test_multi_turn_tighten_no_op_for_cline() -> None:
+    """Cline traffic must not get the LOCAL_FIXUP_NUDGE appended to its
+    last user message, even when the conversation looks fix-up-shaped
+    by accident (multi-turn with assistant code earlier)."""
+    msgs = _cline_messages()
+    # Add an assistant turn that contains a python fence (would
+    # normally trigger the fixup detector) and then a follow-up user
+    # message.
+    msgs.append({
+        "role": "assistant",
+        "content": "Here's the code:\n```python\nprint('hi')\n```",
+    })
+    msgs.append({"role": "user", "content": "Fix the import"})
+    data = {"model": "local-long", "messages": msgs}
+    last_user_before = msgs[-1]["content"]
+    apply_multi_turn_tighten(data)
+    assert msgs[-1]["content"] == last_user_before
+    assert LOCAL_FIXUP_NUDGE not in msgs[-1]["content"]
+
+
+def test_cline_stop_sequences_constant_shape() -> None:
+    """Pin the exact stop list so accidental edits to the constant get
+    caught by the test suite. These four are picked because they are
+    the most common Cline tool tags by frequency observed in dumps."""
+    assert CLINE_STOP_SEQUENCES == [
+        "</replace_in_file>",
+        "</write_to_file>",
+        "</read_file>",
+        "</attempt_completion>",
+    ]
