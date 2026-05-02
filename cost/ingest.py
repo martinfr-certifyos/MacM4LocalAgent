@@ -21,9 +21,40 @@ CLAUDE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    # Order matters: the migration must run BEFORE the schema, because
+    # schema.sql declares an index on `task_id` which references a column
+    # that may not yet exist on databases predating this commit. The
+    # migration is a no-op on fresh databases (the table doesn't exist
+    # yet, PRAGMA returns no rows -> nothing to add).
+    _migrate_requests_columns(conn)
     conn.executescript(SCHEMA_PATH.read_text())
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _migrate_requests_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions for the `requests` table.
+
+    SQLite's `ALTER TABLE ADD COLUMN` is not protected by IF NOT EXISTS, so
+    we introspect the live schema before each ALTER. The CREATE TABLE in
+    schema.sql already lists these columns, so for FRESH databases this
+    is a no-op (PRAGMA returns no rows when the table doesn't yet exist).
+    The migration is here for databases that pre-date a column being
+    added; it lets us evolve the schema without forcing users to wipe
+    cost.db.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    if not cols:
+        # Fresh DB: table doesn't exist yet. CREATE TABLE in schema.sql
+        # will set up everything; nothing to migrate.
+        return
+    for col, ddl in (
+        ("task_id",   "ALTER TABLE requests ADD COLUMN task_id   TEXT"),
+        ("task_text", "ALTER TABLE requests ADD COLUMN task_text TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(ddl)
+    conn.commit()
 
 
 def shadow_cost(in_tok: int, out_tok: int) -> float:
@@ -39,15 +70,25 @@ def record_request(
     actual_cost: float,
     latency_ms: int = 0,
     route_reason: str = "",
+    task_id: str | None = None,
+    task_text: str | None = None,
     ts: int | None = None,
 ) -> int:
-    """Insert one request row. Returns its rowid."""
+    """Insert one request row. Returns its rowid.
+
+    `task_id` and `task_text` are populated for Cline traffic (where the
+    user's prompt is wrapped in a `<task>...</task>` envelope and the
+    router computes a stable fingerprint). For non-Cline traffic, both
+    are NULL and the dashboard's task-grouped views simply skip those
+    rows -- they aren't part of an agent task by definition.
+    """
     conn = connect()
     cur = conn.execute(
         """
         INSERT INTO requests
-          (ts, model, tier, input_tok, output_tok, actual_cost, shadow_cost, latency_ms, route_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (ts, model, tier, input_tok, output_tok, actual_cost, shadow_cost,
+           latency_ms, route_reason, task_id, task_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ts or int(time.time()),
@@ -59,6 +100,8 @@ def record_request(
             shadow_cost(in_tok, out_tok),
             latency_ms,
             route_reason,
+            task_id,
+            task_text,
         ),
     )
     conn.commit()

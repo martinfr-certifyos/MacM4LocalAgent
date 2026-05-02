@@ -1,0 +1,18 @@
+{% extends "_layout.html" %}
+{% block title %}Tasks - M5 Hybrid Agent{% endblock %}
+{% block content %}
+  <h1>Cline tasks</h1>
+  <p class="muted">
+    One row per Cline task (grouped by the <code>&lt;task&gt;</code> fingerprint).
+    Each row rolls up every turn that happened on that task -- token
+    usage, wall time, and which tier(s) handled it. Click a row for the
+    per-turn breakdown.
+  </p>
+
+  <div id="tasks-list"
+       hx-get="/tasks/_list"
+       hx-trigger="load, every 2s"
+       hx-swap="innerHTML">
+    <p class="muted">loading...</p>
+  </div>
+{% endblock %}

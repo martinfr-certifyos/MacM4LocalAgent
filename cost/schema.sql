@@ -10,11 +10,14 @@ CREATE TABLE IF NOT EXISTS requests (
   actual_cost   REAL    NOT NULL DEFAULT 0.0,            -- USD; 0 for local
   shadow_cost   REAL    NOT NULL DEFAULT 0.0,            -- USD; what Claude would have charged
   latency_ms    INTEGER NOT NULL DEFAULT 0,
-  route_reason  TEXT    NOT NULL DEFAULT ''
+  route_reason  TEXT    NOT NULL DEFAULT '',
+  task_id       TEXT,                                    -- 16-char SHA256 of <task> for Cline traffic; NULL otherwise
+  task_text     TEXT                                     -- truncated <task> body, displayed on /tasks
 );
 
-CREATE INDEX IF NOT EXISTS idx_requests_ts   ON requests(ts);
-CREATE INDEX IF NOT EXISTS idx_requests_tier ON requests(tier);
+CREATE INDEX IF NOT EXISTS idx_requests_ts      ON requests(ts);
+CREATE INDEX IF NOT EXISTS idx_requests_tier    ON requests(tier);
+CREATE INDEX IF NOT EXISTS idx_requests_task_id ON requests(task_id);
 
 CREATE TABLE IF NOT EXISTS comparisons (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,

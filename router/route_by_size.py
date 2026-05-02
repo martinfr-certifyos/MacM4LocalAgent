@@ -177,6 +177,12 @@ def _trace_overgen(**kw: Any) -> None:
 def _ensure_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    # Run migration BEFORE schema -- schema.sql declares an index on
+    # task_id which would fail to create on databases predating that
+    # column. The migration is a no-op on fresh databases. We delegate
+    # to cost.ingest's helper to keep the migration logic in one place.
+    from cost.ingest import _migrate_requests_columns
+    _migrate_requests_columns(conn)
     schema = (REPO_ROOT / "cost" / "schema.sql").read_text()
     conn.executescript(schema)
     return conn
@@ -500,7 +506,8 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 # (CLI, raw curl, benchmarks) keep the legacy size-based
                 # logic. Detected via the same fingerprint that drives
                 # over-generation control, so the two stay aligned.
-                if _looks_like_cline(msgs):
+                cline_mode = _looks_like_cline(msgs)
+                if cline_mode:
                     model, reason, tokens = decide_tier_cline(msgs)
                     reason = f"cline-mode: {reason}"
                 else:
@@ -510,6 +517,20 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 meta["route_decision"] = model
                 meta["route_reason"] = reason
                 meta["route_tokens_estimated"] = tokens
+                # For Cline traffic, stamp the task fingerprint and a
+                # truncated copy of the user's task text so the success
+                # callback can persist them. Both default to None for
+                # non-Cline traffic, which makes downstream task-grouped
+                # views naturally exclude CLI/curl callers (they aren't
+                # part of an agent task).
+                if cline_mode:
+                    task_text = _extract_user_task(msgs)
+                    if task_text is not None:
+                        meta["task_id"] = _task_fingerprint(task_text)
+                        # Truncate to keep `requests` rows lean; the
+                        # full task text is never displayed in full,
+                        # only as a preview on /tasks.
+                        meta["task_text"] = task_text[:500]
 
             # Over-generation controls run AFTER the hybrid-auto rewrite
             # so the controls can see the resolved model name. Both
@@ -643,12 +664,17 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             or top_meta.get("route_reason")
             or ""
         )
+        # task_id / task_text are only set for Cline traffic; both
+        # NULL otherwise. SQLite stores NULL natively for None bindings.
+        task_id = nested_meta.get("task_id") or top_meta.get("task_id")
+        task_text = nested_meta.get("task_text") or top_meta.get("task_text")
 
         self._conn.execute(
             """
             INSERT INTO requests
-              (ts, model, tier, input_tok, output_tok, actual_cost, shadow_cost, latency_ms, route_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (ts, model, tier, input_tok, output_tok, actual_cost, shadow_cost,
+               latency_ms, route_reason, task_id, task_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(time.time()),
@@ -660,6 +686,8 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 shadow_cost,
                 latency_ms,
                 reason,
+                task_id,
+                task_text,
             ),
         )
         self._conn.commit()

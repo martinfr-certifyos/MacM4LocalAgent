@@ -57,7 +57,8 @@ def stats_fragment(request: Request) -> Any:
 
     conn = connect()
     recent = [dict(r) for r in conn.execute(
-        "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, latency_ms, route_reason "
+        "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, "
+        "latency_ms, route_reason, task_id "
         "FROM requests ORDER BY id DESC LIMIT 25"
     ).fetchall()]
     conn.close()
@@ -78,6 +79,131 @@ def api_stats() -> JSONResponse:
         "month": summarize(30),
         "all":   summarize(None),
     })
+
+
+# ----- Cline tasks ----------------------------------------------------------
+#
+# Cline tasks are turns-of-the-same-task grouped by `task_id`. The router
+# stamps a 16-hex SHA256 fingerprint of the user's <task> envelope into
+# every request that came through Cline; this UI rolls those rows up.
+
+def _task_summary_rows() -> list[dict[str, Any]]:
+    """Build the per-task rollup. One row per distinct task_id, newest
+    first. Groups every Cline-tagged request and aggregates token,
+    cost, latency, and tier breakdowns."""
+    conn = connect()
+    rows = conn.execute(
+        """
+        SELECT
+            task_id,
+            -- A task's text is the same on every turn, but COALESCE
+            -- defends against the (impossible-but-cheap-to-handle)
+            -- case of NULL on some turns. MAX picks the longest non-null.
+            COALESCE(MAX(task_text), '(no task text)') AS task_text,
+            MIN(ts)             AS started_ts,
+            MAX(ts)             AS ended_ts,
+            COUNT(*)            AS turns,
+            SUM(input_tok)      AS input_tok,
+            SUM(output_tok)     AS output_tok,
+            SUM(actual_cost)    AS actual_cost,
+            SUM(shadow_cost)    AS shadow_cost,
+            SUM(latency_ms)     AS total_latency_ms
+        FROM requests
+        WHERE task_id IS NOT NULL
+        GROUP BY task_id
+        ORDER BY MAX(ts) DESC
+        LIMIT 50
+        """
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        # Tier counts are computed in a follow-up query because SQLite
+        # doesn't have GROUP_CONCAT-with-counts as a clean primitive.
+        # 50 rows * 1 query = 50 queries; acceptable for a local
+        # dashboard. If this becomes a bottleneck we can switch to
+        # a single window-function query.
+        tier_rows = conn.execute(
+            "SELECT tier, COUNT(*) FROM requests WHERE task_id = ? GROUP BY tier",
+            (d["task_id"],),
+        ).fetchall()
+        d["tier_counts"] = {tier: n for tier, n in tier_rows}
+        d["started_human"] = _fmt_ts(d["started_ts"])
+        d["wall_seconds"] = max(0, d["ended_ts"] - d["started_ts"])
+        # Truncate displayed task text. The DB-side cap is 500 chars
+        # already, but the table cell looks bad with anything > ~100.
+        text = d["task_text"]
+        d["task_text_short"] = (text[:100] + "...") if len(text) > 100 else text
+        out.append(d)
+    conn.close()
+    return out
+
+
+@app.get("/tasks", response_class=HTMLResponse)
+def tasks_index(request: Request) -> Any:
+    """Full page; the actual table is loaded via HTMX into a placeholder."""
+    return templates.TemplateResponse(request, "tasks_index.html", {})
+
+
+@app.get("/tasks/_list", response_class=HTMLResponse)
+def tasks_list_fragment(request: Request) -> Any:
+    """HTMX-polled fragment with the live task list. Returns just the
+    table HTML so the parent page can swap it without re-rendering
+    the chrome."""
+    return templates.TemplateResponse(
+        request, "_tasks_list.html",
+        {"tasks": _task_summary_rows()},
+    )
+
+
+@app.get("/tasks/{task_id}", response_class=HTMLResponse)
+def tasks_one(request: Request, task_id: str) -> Any:
+    """Drill-down: the full per-turn breakdown for one task. Useful
+    for understanding WHY a task escalated to Claude on turn 3."""
+    conn = connect()
+    turns_rows = conn.execute(
+        "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, "
+        "shadow_cost, latency_ms, route_reason "
+        "FROM requests WHERE task_id = ? ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    if not turns_rows:
+        conn.close()
+        return HTMLResponse(f"<p>task {task_id} not found</p>", status_code=404)
+
+    turns = [dict(r) for r in turns_rows]
+    for r in turns:
+        r["ts_human"] = _fmt_ts(r["ts"])
+
+    # Pull the task_text once -- it's the same on every turn (router
+    # writes it identically for each request belonging to a task).
+    text_row = conn.execute(
+        "SELECT task_text FROM requests WHERE task_id = ? AND task_text IS NOT NULL LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    conn.close()
+
+    # Summary mirrors the fields shown on the index page so the same
+    # template macros (tier-badges, etc.) work without per-page
+    # special-casing.
+    summary: dict[str, Any] = {
+        "task_text": text_row[0] if text_row else "(no task text)",
+        "started_human": _fmt_ts(turns[0]["ts"]),
+        "turns": len(turns),
+        "wall_seconds": max(0, turns[-1]["ts"] - turns[0]["ts"]),
+        "input_tok": sum(r["input_tok"] for r in turns),
+        "output_tok": sum(r["output_tok"] for r in turns),
+        "actual_cost": sum(r["actual_cost"] for r in turns),
+        "shadow_cost": sum(r["shadow_cost"] for r in turns),
+        "tier_counts": {},
+    }
+    for r in turns:
+        summary["tier_counts"][r["tier"]] = summary["tier_counts"].get(r["tier"], 0) + 1
+
+    return templates.TemplateResponse(
+        request, "tasks_one.html",
+        {"task_id": task_id, "summary": summary, "turns": turns},
+    )
 
 
 @app.get("/compare", response_class=HTMLResponse)

@@ -602,3 +602,151 @@ def test_pre_call_non_cline_traffic_uses_legacy_routing() -> None:
     assert new["model"] == "local-fast"
     # And the reason should NOT have the cline-mode prefix.
     assert "cline-mode" not in new["metadata"]["route_reason"]
+
+
+# ---- task_id / task_text stamping --------------------------------------------
+#
+# For task-grouped views in the dashboard, every Cline request needs a stable
+# task_id (so turns of the same task can be rolled up) and a truncated copy of
+# the user's actual task text (so the UI can show 'add a comment to README'
+# rather than just a 16-hex hash). Non-Cline traffic must NOT have either,
+# because there's no <task> envelope to fingerprint and the dashboard's
+# task views explicitly skip those rows.
+
+def test_pre_call_stamps_task_id_for_cline_traffic() -> None:
+    """Every Cline request gets a task_id (the task fingerprint) in
+    its metadata, regardless of whether routing escalated. This is
+    what enables grouping turns in the dashboard."""
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("Add a one-line comment to README.md"),
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    meta = new["metadata"]
+    assert "task_id" in meta
+    # 16 hex chars from SHA256 truncation in _task_fingerprint.
+    assert len(meta["task_id"]) == 16
+    assert all(ch in "0123456789abcdef" for ch in meta["task_id"])
+
+
+def test_pre_call_stamps_task_text_for_cline_traffic() -> None:
+    """task_text is the actual user prompt, truncated for storage but
+    long enough to be readable in the dashboard's tasks list."""
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("Add a one-line comment to README.md"),
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    assert new["metadata"]["task_text"] == "Add a one-line comment to README.md"
+
+
+def test_pre_call_truncates_long_task_text() -> None:
+    """Task text is capped at 500 chars to keep `requests` rows lean.
+    Cline tasks rarely run that long, but we don't want a runaway
+    paste to bloat every successive row."""
+    long_task = "Refactor " + ("the auth code " * 200)  # ~2.8 KB
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs(long_task),
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    assert len(new["metadata"]["task_text"]) == 500
+
+
+def test_pre_call_same_task_produces_same_task_id() -> None:
+    """Two turns of the same Cline task share a fingerprint -- this is
+    what enables roll-up in the dashboard. Whitespace and indentation
+    inside <task> shouldn't break the match."""
+    router1 = SizeBasedRouter()
+    router2 = SizeBasedRouter()
+
+    data1: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("Add a comment"),
+    }
+    data2: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("Add\n  a    comment"),
+    }
+    new1 = asyncio.run(router1.async_pre_call_hook(None, None, data1, "completion"))
+    new2 = asyncio.run(router2.async_pre_call_hook(None, None, data2, "completion"))
+    assert new1["metadata"]["task_id"] == new2["metadata"]["task_id"]
+
+
+def test_pre_call_does_not_stamp_task_id_for_non_cline() -> None:
+    """Non-Cline traffic has no <task> envelope, so the metadata
+    must NOT contain task_id / task_text. Otherwise the dashboard
+    would group unrelated CLI calls into a phantom task."""
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": [{"role": "user", "content": "raw curl request"}],
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    meta = new.get("metadata", {})
+    assert "task_id" not in meta
+    assert "task_text" not in meta
+
+
+def test_log_success_persists_task_id_and_text(
+    router: SizeBasedRouter, tmp_db,
+) -> None:
+    """End-to-end: the success callback reads task_id and task_text
+    from kwargs['litellm_params']['metadata'] (the path LiteLLM uses
+    by the callback phase) and writes them to the requests table."""
+    start = time.time()
+    router.log_success_event(
+        kwargs={
+            "model": "local-long",
+            "litellm_params": {
+                "metadata": {
+                    "route_decision": "local-long",
+                    "route_reason": "cline-mode: cline+default: task=12 tok",
+                    "task_id": "abcdef0123456789",
+                    "task_text": "Add a comment to README",
+                },
+            },
+        },
+        response_obj=_FakeResponse(15000, 200),
+        start_time=start,
+        end_time=start + 1.5,
+    )
+    row = router._conn.execute(
+        "SELECT task_id, task_text FROM requests WHERE model='local-long'"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "abcdef0123456789"
+    assert row[1] == "Add a comment to README"
+
+
+def test_log_success_persists_null_task_id_for_non_cline(
+    router: SizeBasedRouter, tmp_db,
+) -> None:
+    """Non-Cline rows have no task fingerprint; both columns must be
+    NULL so the dashboard's `WHERE task_id IS NOT NULL` filter
+    excludes them cleanly."""
+    start = time.time()
+    router.log_success_event(
+        kwargs={
+            "model": "local-fast",
+            "litellm_params": {
+                "metadata": {"route_reason": "tokens 10 <= 16000"},
+            },
+        },
+        response_obj=_FakeResponse(10, 5),
+        start_time=start,
+        end_time=start + 0.1,
+    )
+    row = router._conn.execute(
+        "SELECT task_id, task_text FROM requests WHERE model='local-fast'"
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None
+    assert row[1] is None

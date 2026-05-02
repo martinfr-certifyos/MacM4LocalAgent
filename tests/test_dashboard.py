@@ -96,3 +96,135 @@ def test_compare_run_creates_row(client: TestClient, monkeypatch: pytest.MonkeyP
     assert "say hi" in one.text
     assert "answer for local-long"  in one.text
     assert "answer for claude-code" in one.text
+
+
+# ---- /tasks pages ------------------------------------------------------------
+#
+# The Tasks views aggregate Cline traffic by task_id. Every test here seeds
+# a representative shape (one Cline task with multiple turns + one non-Cline
+# row that should be EXCLUDED from the task views).
+
+def _seed_cline_task(now: int) -> None:
+    """Seed one Cline task with three turns + one unrelated non-Cline row.
+    Picked to exercise: tier rollup (local-long + claude), latency totals,
+    NULL task_id exclusion, and ordering."""
+    ingest.record_request(
+        model="ollama/qwen3-coder-next:q4_K_M",
+        tier="local-long",
+        in_tok=13000, out_tok=120, actual_cost=0.0, latency_ms=2000,
+        ts=now - 30,
+        route_reason="cline-mode: cline+default: task=8 tok",
+        task_id="abc123def4567890",
+        task_text="Add a one-line comment to README.md",
+    )
+    ingest.record_request(
+        model="ollama/qwen3-coder-next:q4_K_M",
+        tier="local-long",
+        in_tok=14000, out_tok=200, actual_cost=0.0, latency_ms=2200,
+        ts=now - 20,
+        route_reason="cline-mode: cline+default: task=8 tok",
+        task_id="abc123def4567890",
+        task_text="Add a one-line comment to README.md",
+    )
+    ingest.record_request(
+        model="claude-sonnet-4-6",
+        tier="claude",
+        in_tok=15000, out_tok=400, actual_cost=0.0510, latency_ms=3500,
+        ts=now - 10,
+        route_reason="cline-mode: cline+sticky(abc123def4567890): traceback",
+        task_id="abc123def4567890",
+        task_text="Add a one-line comment to README.md",
+    )
+    # Non-Cline traffic: must NOT appear on /tasks because task_id IS NULL.
+    ingest.record_request(
+        model="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+        tier="local-fast",
+        in_tok=50, out_tok=10, actual_cost=0.0, latency_ms=200,
+        ts=now - 5,
+        route_reason="tokens 50 <= 16000",
+    )
+
+
+def test_tasks_index_renders(client: TestClient) -> None:
+    r = client.get("/tasks")
+    assert r.status_code == 200
+    # Page includes the HTMX target div that polls /tasks/_list.
+    assert 'hx-get="/tasks/_list"' in r.text
+
+
+def test_tasks_list_empty(client: TestClient) -> None:
+    """Fresh DB: no rows, the fragment shows the friendly empty-state."""
+    r = client.get("/tasks/_list")
+    assert r.status_code == 200
+    assert "No Cline tasks yet" in r.text
+
+
+def test_tasks_list_groups_by_task_id(client: TestClient) -> None:
+    """Three turns of one task collapse to ONE row in the list, with
+    aggregate counts and tier breakdown."""
+    _seed_cline_task(int(time.time()))
+    r = client.get("/tasks/_list")
+    assert r.status_code == 200
+    # Task text is rendered once (the rollup row).
+    assert r.text.count("Add a one-line comment to README.md") == 1
+    # Tier breakdown shows both local-long and claude with their counts.
+    assert "local-long: 2" in r.text
+    assert "claude: 1" in r.text
+    # Task fingerprint is shown as a code block under the text.
+    assert "abc123def4567890" in r.text
+
+
+def test_tasks_list_excludes_non_cline_rows(client: TestClient) -> None:
+    """Non-Cline rows have task_id=NULL and must not appear on /tasks --
+    they aren't part of any agent task."""
+    _seed_cline_task(int(time.time()))
+    r = client.get("/tasks/_list")
+    assert r.status_code == 200
+    # The mlx model from the non-Cline seed row must NOT appear.
+    assert "mlx-community" not in r.text
+    assert "local-fast" not in r.text
+
+
+def test_tasks_one_renders_per_turn_breakdown(client: TestClient) -> None:
+    """Drill-down: every turn for a task in chronological order with
+    full route_reason, tier, and cost columns."""
+    _seed_cline_task(int(time.time()))
+    r = client.get("/tasks/abc123def4567890")
+    assert r.status_code == 200
+    assert "Add a one-line comment to README.md" in r.text
+    # All three turns are rendered (turn count badge in the summary card).
+    assert "<b>3</b>" in r.text or ">3<" in r.text
+    # Each turn's route_reason should be present, including the sticky one.
+    assert "cline+sticky" in r.text
+    assert "cline+default" in r.text
+
+
+def test_tasks_one_404_for_unknown_id(client: TestClient) -> None:
+    r = client.get("/tasks/nonexistent")
+    assert r.status_code == 404
+    assert "not found" in r.text
+
+
+def test_tasks_one_aggregates_cost_correctly(client: TestClient) -> None:
+    """Summary card totals must equal the sum of the turn rows. Pinning
+    this prevents future refactors from quietly breaking cost rollup."""
+    _seed_cline_task(int(time.time()))
+    r = client.get("/tasks/abc123def4567890")
+    assert r.status_code == 200
+    # The seeded data: 13000 + 14000 + 15000 = 42000 input, 120 + 200 + 400 = 720 out
+    # Actual: 0 + 0 + 0.051 = $0.0510
+    assert "42,000" in r.text
+    assert "720" in r.text
+    assert "0.0510" in r.text
+
+
+def test_stats_recent_table_links_to_task(client: TestClient) -> None:
+    """Cline rows in the /stats recent-requests table should link to
+    /tasks/<id>; non-Cline rows show a dash."""
+    _seed_cline_task(int(time.time()))
+    r = client.get("/stats")
+    assert r.status_code == 200
+    # Cline rows: linkified short-id.
+    assert 'href="/tasks/abc123def4567890"' in r.text
+    # Non-Cline row: dash placeholder.
+    assert "<span class=\"muted small\">-</span>" in r.text

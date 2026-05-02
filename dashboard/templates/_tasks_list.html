@@ -1,0 +1,42 @@
+{% if tasks %}
+<table>
+  <thead>
+    <tr>
+      <th>started</th>
+      <th>task</th>
+      <th>turns</th>
+      <th>tiers</th>
+      <th>tokens (in / out)</th>
+      <th>$ actual</th>
+      <th>$ shadow</th>
+      <th>wall time</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in tasks %}
+    <tr>
+      <td>{{ t.started_human }}</td>
+      <td>
+        <a href="/tasks/{{ t.task_id }}">
+          {{ t.task_text_short }}
+        </a>
+        <div class="muted small"><code>{{ t.task_id }}</code></div>
+      </td>
+      <td>{{ t.turns }}</td>
+      <td>
+        {% for tier, n in t.tier_counts.items() %}
+          <span class="tier tier-{{ tier }}">{{ tier }}: {{ n }}</span>
+        {% endfor %}
+      </td>
+      <td>{{ "{:,}".format(t.input_tok) }} / {{ "{:,}".format(t.output_tok) }}</td>
+      <td>${{ "%.4f"|format(t.actual_cost) }}</td>
+      <td class="muted">${{ "%.4f"|format(t.shadow_cost) }}</td>
+      <td>{{ "%.1f"|format(t.wall_seconds) }}s</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+  <p class="muted">No Cline tasks yet. Open Cline and start a task on
+    <code>gpt-hybrid-auto</code> -- it'll show up here within 2s.</p>
+{% endif %}

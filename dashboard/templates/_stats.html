@@ -29,7 +29,7 @@
 <table>
   <thead>
     <tr>
-      <th>id</th><th>time</th><th>tier</th><th>model</th>
+      <th>id</th><th>time</th><th>tier</th><th>task</th><th>model</th>
       <th>in</th><th>out</th><th>$ actual</th><th>ms</th><th>reason</th>
     </tr>
   </thead>
@@ -39,6 +39,13 @@
       <td>{{ r.id }}</td>
       <td>{{ r.ts_human }}</td>
       <td><span class="tier tier-{{ r.tier }}">{{ r.tier }}</span></td>
+      <td>
+        {% if r.task_id %}
+          <a href="/tasks/{{ r.task_id }}"><code class="small">{{ r.task_id[:8] }}</code></a>
+        {% else %}
+          <span class="muted small">-</span>
+        {% endif %}
+      </td>
       <td><code>{{ r.model }}</code></td>
       <td>{{ "{:,}".format(r.input_tok) }}</td>
       <td>{{ "{:,}".format(r.output_tok) }}</td>
