@@ -27,15 +27,19 @@ This workspace runs a hybrid local+cloud LLM setup behind LiteLLM
 
 - **local-fast** — MLX, Qwen3-Coder-Next, ≤16k context, ~70 tok/s, free.
 - **local-long** — Ollama + TurboQuant tq3 KV cache, ≤${LOCAL_LONG_CTX} ctx, free.
-- **claude-code** — Anthropic Claude Sonnet 4.6, 1M context, \$3 in / \$15 out per 1M.
+- **claude-code** — default Claude tier, currently mapped to Opus 4.7 (\$5 in / \$25 out per MTok, 1M context).
+- **claude-haiku-4-5** / **claude-sonnet-4-6** / **claude-opus-4-7** — pinned to a specific Claude model.
 - **hybrid-auto** — let the router decide based on size + heuristic complexity.
 
 ## Decision tree
 
 \`\`\`
-Is the prompt explicitly tagged?
-├─ "[claude] ..." ────────────────► claude-code   (force cloud)
-└─ "[local]  ..." ────────────────► local-fast / local-long  (force local)
+Is the prompt explicitly tagged at the start?
+├─ "[local] ..."  ────────────────► local-long  (absolute opt-out)
+├─ "[haiku] ..."  ────────────────► claude-haiku-4-5
+├─ "[sonnet] ..." ────────────────► claude-sonnet-4-6
+├─ "[opus] ..."   ────────────────► claude-opus-4-7
+└─ "[claude] ..." ────────────────► claude-code (default Claude tier)
 
 Else, by content:
 ├─ Architectural / multi-file / deep reasoning ──► claude-code
@@ -46,13 +50,15 @@ Else, by content:
 
 ## Worked examples
 
-| Prompt                                              | Tier         | Why                                |
-| --------------------------------------------------- | ------------ | ---------------------------------- |
-| "Rename \`foo\` to \`bar\` in this file."           | local-fast   | tiny, single-file                  |
-| "Summarize this 60k-token codebase dump."           | local-long   | size only, not architectural       |
-| "Refactor the auth subsystem across 12 services."   | claude-code  | architectural + multi-file         |
-| "[local] Refactor across multiple files."           | local-fast   | tag overrides classifier           |
-| "[claude] hello world"                              | claude-code  | tag overrides size                 |
+| Prompt                                              | Tier               | Why                                |
+| --------------------------------------------------- | ------------------ | ---------------------------------- |
+| "Rename \`foo\` to \`bar\` in this file."           | local-fast         | tiny, single-file                  |
+| "Summarize this 60k-token codebase dump."           | local-long         | size only, not architectural       |
+| "Refactor the auth subsystem across 12 services."   | claude-code (Opus) | architectural + multi-file         |
+| "[local] Refactor across multiple files."           | local-long         | absolute opt-out wins              |
+| "[haiku] What is 2+2?"                              | claude-haiku-4-5   | explicit cheap-Claude pin          |
+| "[opus] design a billing service"                   | claude-opus-4-7    | explicit Opus pin                  |
+| "[claude] hello world"                              | claude-code (Opus) | default Claude tier                |
 
 ## Cost model
 

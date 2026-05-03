@@ -12,8 +12,10 @@ and also drives the A/B comparator via compare/ab.py.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import pathlib
 import sys
+import time
 from typing import Any
 
 from fastapi import FastAPI, Form, Request
@@ -25,8 +27,15 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from cost.ingest import connect       # noqa: E402
+from cost.pricing import sonnet_rate  # noqa: E402
 from cost.savings import summarize    # noqa: E402
 from compare.ab import run as ab_run  # noqa: E402
+
+# Mirror of the in-flight registry maintained by the LiteLLM-side
+# router callback. Written by router/route_by_size.py:_flush_active(),
+# read here on every /stats poll. The two processes never share
+# memory, so this file is the IPC channel.
+ACTIVE_PATH = REPO_ROOT / ".logs" / "active.json"
 
 app = FastAPI(title="MacM4LocalAgent Dashboard")
 templates = Jinja2Templates(directory=str(REPO_ROOT / "dashboard" / "templates"))
@@ -38,6 +47,57 @@ app.mount("/static", StaticFiles(directory=str(REPO_ROOT / "dashboard" / "static
 
 def _fmt_ts(ts: int) -> str:
     return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _estimate_active_cost(entry: dict[str, Any]) -> float:
+    """Lower-bound cost estimate for an in-flight call.
+
+    Local tiers are free, so always return 0.0. For Claude calls we
+    have the input-token estimate the router stamped at routing time
+    (`route_tokens_estimated`), but no output tokens yet -- they
+    only land on success. We use the canonical Sonnet rate as the
+    shadow baseline; the real bill might be Haiku/Opus, but this
+    column is explicitly labelled "(est)" in the UI to make the
+    approximation visible. The post-completion `actual_cost` in
+    `requests` is always authoritative."""
+    if entry.get("tier") != "claude":
+        return 0.0
+    in_tok = int(entry.get("in_tok_est", 0) or 0)
+    if in_tok <= 0:
+        return 0.0
+    rate = sonnet_rate()
+    return in_tok * rate.input
+
+
+def _load_active() -> list[dict[str, Any]]:
+    """Read the router's in-flight snapshot. Returns [] on any failure
+    -- the dashboard must never crash because the proxy hasn't
+    written this file yet (cold-start ordering) or because the file
+    is being rewritten mid-poll."""
+    try:
+        raw = ACTIVE_PATH.read_text()
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    try:
+        rows = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        started = float(r.get("started", now))
+        r["elapsed_sec"] = max(0.0, now - started)
+        r["est_cost"] = _estimate_active_cost(r)
+        out.append(r)
+    # Newest first matches the recent-requests table.
+    out.sort(key=lambda r: r.get("started", 0), reverse=True)
+    return out
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -65,9 +125,12 @@ def stats_fragment(request: Request) -> Any:
     for r in recent:
         r["ts_human"] = _fmt_ts(r["ts"])
 
+    active = _load_active()
+
     return templates.TemplateResponse(
         request, "_stats.html",
-        {"today": today, "week": week, "alltime": alltime, "recent": recent},
+        {"today": today, "week": week, "alltime": alltime,
+         "recent": recent, "active": active},
     )
 
 
@@ -78,6 +141,7 @@ def api_stats() -> JSONResponse:
         "week":  summarize(7),
         "month": summarize(30),
         "all":   summarize(None),
+        "active": _load_active(),
     })
 
 

@@ -11,12 +11,18 @@ import pytest
 from router.complexity_classifier import classify
 from router.route_by_size import (
     SizeBasedRouter,
+    _check_sticky,
     _estimate_tokens,
+    _extract_model_override,
     _extract_user_task,
     _flat_prompt,
     _looks_like_failure,
+    _mark_sticky,
+    _mark_sticky_turns,
     _sticky_escalations,
     _task_fingerprint,
+    _TOOL_RESULT_STICKY_TURNS,
+    _UNBOUNDED,
     decide_tier,
     decide_tier_cline,
     ROUTE_FAST_MAX,
@@ -447,7 +453,12 @@ def test_decide_tier_cline_local_tag_overrides_failure_signal() -> None:
     assert "[local]" in reason
 
 
-def test_decide_tier_cline_python_traceback_escalates_on_turn3() -> None:
+def test_decide_tier_cline_single_traceback_no_longer_escalates() -> None:
+    """Rule A: a single Python traceback in a tool result is NOT
+    enough to escalate. Local model gets to keep the task. This
+    is the behavior change introduced after observing a 35K-token
+    architectural overview unnecessarily flip to Claude on one
+    panic in passing."""
     failure = (
         "[read_file] Result:\n"
         "Traceback (most recent call last):\n"
@@ -461,8 +472,55 @@ def test_decide_tier_cline_python_traceback_escalates_on_turn3() -> None:
         {"role": "user", "content": failure},
     )
     tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "local-long"
+    assert "default" in reason
+
+
+def test_decide_tier_cline_two_tracebacks_escalate() -> None:
+    """Rule A: two distinct python tracebacks in one tool result
+    is a strong-enough signal to escalate. The corroboration
+    (>=2 frames within the SAME high-confidence category) is what
+    makes this different from a single one-off."""
+    failure = (
+        "[execute_command] Result:\n"
+        "Traceback (most recent call last):\n"
+        '  File "x.py", line 5, in <module>\n'
+        "    raise ValueError\n"
+        "ValueError: first\n"
+        "----\n"
+        "Traceback (most recent call last):\n"
+        '  File "y.py", line 8, in handler\n'
+        "    raise RuntimeError\n"
+        "RuntimeError: second"
+    )
+    msgs = _cline_msgs(
+        "Run the test suite",
+        {"role": "assistant", "content": "Running tests."},
+        {"role": "user", "content": failure},
+    )
+    tier, reason, _ = decide_tier_cline(msgs)
     assert tier == "claude-code"
     assert "traceback" in reason
+
+
+def test_decide_tier_cline_panic_plus_error_lines_escalates() -> None:
+    """Rule A: a single panic combined with multiple `error:`
+    lines is two distinct error categories => escalate."""
+    failure = (
+        "[execute_command] Result:\n"
+        "thread 'main' panicked at 'unwrap on None', src/main.rs:42\n"
+        "error: process didn't exit successfully\n"
+        "error: build failed\n"
+        "error: aborting due to previous errors"
+    )
+    msgs = _cline_msgs(
+        "Build the rust crate",
+        {"role": "assistant", "content": "Building."},
+        {"role": "user", "content": failure},
+    )
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-code"
+    assert "multiple error signals" in reason
 
 
 def test_decide_tier_cline_big_file_dump_does_not_escalate() -> None:
@@ -522,6 +580,141 @@ def test_decide_tier_cline_different_task_resets_stickiness() -> None:
     assert "default" in reason2
 
 
+# ---- bounded vs unbounded stickiness (rule B) ----
+
+def test_mark_sticky_is_time_bounded_unbounded_turns() -> None:
+    """Time-bounded entries (used for explicit tags and complexity
+    escalations) carry the sentinel _UNBOUNDED in the turns slot,
+    so _check_sticky won't decrement them."""
+    _sticky_escalations.clear()
+    _mark_sticky("fp", "explicit [opus] tag")
+    _, _, remaining = _sticky_escalations["fp"]
+    assert remaining == _UNBOUNDED
+
+    # Many reads should not evict it.
+    for _ in range(20):
+        assert _check_sticky("fp") == "explicit [opus] tag"
+    assert "fp" in _sticky_escalations
+
+
+def test_mark_sticky_turns_evicts_after_budget() -> None:
+    """Turn-bounded entries decrement on each successful read and
+    self-evict when the budget hits zero, so the next call
+    re-evaluates from scratch."""
+    _sticky_escalations.clear()
+    _mark_sticky_turns("fp", "rust panic", 3)
+
+    # 3 successful reads, then eviction.
+    assert _check_sticky("fp") == "rust panic"
+    assert _check_sticky("fp") == "rust panic"
+    assert _check_sticky("fp") == "rust panic"
+    assert _check_sticky("fp") is None
+    assert "fp" not in _sticky_escalations
+
+
+def test_decide_tier_cline_tool_result_sticky_expires_after_three_turns() -> None:
+    """End-to-end: a tool-result-driven escalation should keep the
+    task on Claude for exactly _TOOL_RESULT_STICKY_TURNS subsequent
+    turns, then release it back to local-long."""
+    _sticky_escalations.clear()
+    task = "Fix the build"
+
+    failure = (
+        "[execute_command] Result:\n"
+        "thread 'main' panicked at A\n"
+        "thread 'worker' panicked at B"
+    )
+
+    # Turn 2: failure triggers escalation. This call DOES NOT consume
+    # a budget slot (the entry is fresh-created in this same call).
+    msgs_fail = _cline_msgs(
+        task,
+        {"role": "assistant", "content": "Trying."},
+        {"role": "user", "content": failure},
+    )
+    tier, reason, _ = decide_tier_cline(msgs_fail)
+    assert tier == "claude-code"
+    assert "panic" in reason
+
+    # Subsequent turns with CLEAN tool results -- the only thing
+    # keeping these on Claude is the sticky entry. With a 3-turn
+    # budget, exactly 3 reads should still hit sticky, then the
+    # 4th should re-evaluate to local-long.
+    clean = "[read_file] Result: file content\nfoo"
+    base_msgs = lambda: _cline_msgs(  # noqa: E731
+        task,
+        {"role": "assistant", "content": "Continuing."},
+        {"role": "user", "content": clean},
+    )
+
+    sticky_tiers = []
+    for _ in range(_TOOL_RESULT_STICKY_TURNS):
+        t, r, _ = decide_tier_cline(base_msgs())
+        sticky_tiers.append((t, r))
+    assert all(t == "claude-code" for t, _ in sticky_tiers), sticky_tiers
+    assert all("sticky" in r for _, r in sticky_tiers), sticky_tiers
+
+    # Budget exhausted -- next read drops back to local-long.
+    final_tier, final_reason, _ = decide_tier_cline(base_msgs())
+    assert final_tier == "local-long"
+    assert "default" in final_reason
+
+
+def test_decide_tier_cline_tag_sticky_does_not_expire_in_3_turns() -> None:
+    """Contrast with the tool-result test: explicit `[opus]` tag
+    stickiness is time-bounded (no turn budget), so it must NOT
+    expire after 3 turns. This is what the user explicitly asked
+    for: 'tag-driven escalations keep using the existing 30-min
+    stickiness'."""
+    _sticky_escalations.clear()
+    task = "[opus] Write a haiku"
+
+    msgs1 = _cline_msgs(task)
+    tier1, reason1, _ = decide_tier_cline(msgs1)
+    assert tier1 == "claude-opus-4-7"
+    assert "[opus]" in reason1
+
+    # 5 follow-up turns (Cline replays the tagged task verbatim
+    # because that's how its harness works). All must stay sticky
+    # on Claude. NOTE: the sticky-replay branch in decide_tier_cline
+    # currently always returns "claude-code" -- it preserves
+    # *whether* the task was escalated, not which specific Claude
+    # model was originally chosen. The important assertion for
+    # rule B is that we don't drop back to local-long after 3
+    # turns (which is what the bounded-stickiness path would do).
+    for i in range(5):
+        msgs = _cline_msgs(
+            task,
+            {"role": "assistant", "content": f"Turn {i}"},
+            {"role": "user", "content": "[read_file] Result: ok"},
+        )
+        tier, reason, _ = decide_tier_cline(msgs)
+        assert tier == "claude-code", f"turn {i+2}: {tier!r}"
+        assert "sticky" in reason, f"turn {i+2}: {reason!r}"
+        assert "[opus]" in reason, f"turn {i+2}: original tag reason lost: {reason!r}"
+
+
+def test_decide_tier_cline_complexity_sticky_does_not_expire_in_3_turns() -> None:
+    """Same contrast for complexity-keyword escalations: those are
+    also time-bounded, not turn-bounded."""
+    _sticky_escalations.clear()
+    task = "Refactor the entire authentication architecture"
+
+    msgs1 = _cline_msgs(task)
+    tier1, _, _ = decide_tier_cline(msgs1)
+    assert tier1 == "claude-code"
+
+    for i in range(5):
+        msgs = _cline_msgs(
+            task,
+            {"role": "assistant", "content": f"Turn {i}"},
+            {"role": "user", "content": "[read_file] Result: ok"},
+        )
+        tier, reason, _ = decide_tier_cline(msgs)
+        assert tier == "claude-code", f"turn {i+2}: {tier!r}"
+        assert "sticky" in reason, f"turn {i+2}: {reason!r}"
+
+
 def test_task_fingerprint_normalizes_whitespace() -> None:
     """The same task with different whitespace (Cline indents
     inconsistently in the <task> envelope) must produce the same
@@ -533,27 +726,65 @@ def test_task_fingerprint_normalizes_whitespace() -> None:
 
 
 @pytest.mark.parametrize(
-    "text,is_failure",
+    "text,is_failure,note",
     [
-        ("just some output", False),
-        ("Traceback (most recent call last):\n  File 'x'", True),
-        ("thread 'main' panicked at 'oops', src/main.rs:5", True),
+        # ---- non-failure cases ----
+        ("just some output", False, "no error signals at all"),
+        # Rule A: single weak signals do NOT escalate.
+        ("Traceback (most recent call last):\n  File 'x'", False,
+         "single python traceback alone -- need corroboration"),
+        ("thread 'main' panicked at 'oops', src/main.rs:5", False,
+         "single rust panic alone -- need corroboration"),
+        ("error: file not found", False, "single error: line is noisy on its own"),
+        ("at foo (file.js:5:3)", False, "single js stack frame is suspicious but not enough"),
+        # 2 frames was the OLD JS threshold; new threshold is >=3
+        # within a single category.
+        ("at foo (file.js:5:3)\n  at bar (file.js:10:5)", False,
+         "2 js stack frames alone -- bumped threshold to 3"),
+        ("error: file not found\nerror: cannot read", False,
+         "2 error: lines (need >=3 to even register the category, then need corroboration)"),
+
+        # ---- failure cases ----
+        # Strong single-category: >=2 panics is a real meltdown.
         (
-            "stack:\n  at foo (file.js:5:3)\n  at bar (file.js:10:5)",
+            "thread 'main' panicked at A\nthread 'worker' panicked at B",
             True,
+            ">=2 distinct rust panics",
         ),
-        ("error: file not found\nerror: cannot read\nerror: aborting", True),
-        # Single 'error:' line is NOT enough -- Cline emits these in
-        # benign log output sometimes.
-        ("error: file not found", False),
-        # JS stack with only one frame is suspicious but not strong
-        # enough on its own.
-        ("at foo (file.js:5:3)", False),
+        # Strong single-category: >=2 python tracebacks.
+        (
+            "Traceback (most recent call last):\n  File 'a'\n"
+            "----\n"
+            "Traceback (most recent call last):\n  File 'b'",
+            True,
+            ">=2 distinct python tracebacks",
+        ),
+        # Strong single-category: >=3 JS frames.
+        (
+            "stack:\n  at foo (a.js:1:1)\n  at bar (b.js:2:2)\n  at baz (c.js:3:3)",
+            True,
+            ">=3 js stack frames",
+        ),
+        # Cross-category: panic + error: lines (>=3) is two distinct
+        # categories, escalates.
+        (
+            "thread 'main' panicked at 'X', src/main.rs:5\n"
+            "error: A\nerror: B\nerror: C",
+            True,
+            "panic + 3 error: lines (cross-category)",
+        ),
+        # Cross-category: traceback + JS frame.
+        (
+            "Traceback (most recent call last):\n  File 'x'\n"
+            "stack:\n  at foo (a.js:1:1)",
+            True,
+            "py traceback + js stack frame (cross-category)",
+        ),
     ],
 )
-def test_looks_like_failure(text: str, is_failure: bool) -> None:
+def test_looks_like_failure(text: str, is_failure: bool, note: str) -> None:
     got, _reason = _looks_like_failure(text)
-    assert got is is_failure
+    assert got is is_failure, f"{note}: got {got!r}, expected {is_failure!r}"
 
 
 def test_pre_call_uses_cline_aware_path_for_cline_traffic() -> None:
@@ -750,3 +981,203 @@ def test_log_success_persists_null_task_id_for_non_cline(
     assert row is not None
     assert row[0] is None
     assert row[1] is None
+
+
+# ---- inline model override tags ([haiku] / [sonnet] / [opus]) ---------------
+
+# These tests cover the per-turn Claude-tier override added so users can
+# escalate (or de-escalate) without changing their default model. The
+# tags must be at the START of the task to avoid false positives from
+# bracketed words inside Cline's system prompt or tool docs.
+
+@pytest.mark.parametrize(
+    "task,expected_alias,expected_tag",
+    [
+        ("[haiku] What is 2+2?",         "claude-haiku-4-5",  "haiku"),
+        ("[sonnet] Refactor this fn",    "claude-sonnet-4-6", "sonnet"),
+        ("[opus] design a billing svc",  "claude-opus-4-7",   "opus"),
+        ("[OPUS] uppercase tag works",   "claude-opus-4-7",   "opus"),
+        ("  [opus]   leading whitespace OK", "claude-opus-4-7", "opus"),
+    ],
+)
+def test_extract_model_override_recognizes_leading_tags(
+    task: str, expected_alias: str, expected_tag: str,
+) -> None:
+    alias, tag = _extract_model_override(task)
+    assert alias == expected_alias
+    assert tag == expected_tag
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "",                                      # empty
+        "do the thing [opus] please",            # not leading
+        "Please [opus] this for me",             # not leading
+        "[haik] typo",                           # unknown tag
+        "[claude] use default Claude",           # handled separately, not here
+        "[local] no Claude at all",              # handled separately, not here
+        "<task>[opus] inside envelope</task>",   # extractor receives the inner text already
+    ],
+)
+def test_extract_model_override_rejects_non_leading_or_unknown(task: str) -> None:
+    alias, tag = _extract_model_override(task)
+    assert alias is None
+    assert tag is None
+
+
+def test_decide_tier_cline_haiku_tag_routes_to_haiku() -> None:
+    msgs = _cline_msgs("[haiku] What is 2+2?")
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-haiku-4-5"
+    assert "[haiku]" in reason
+
+
+def test_decide_tier_cline_sonnet_tag_routes_to_sonnet() -> None:
+    msgs = _cline_msgs("[sonnet] Add error handling here")
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-sonnet-4-6"
+    assert "[sonnet]" in reason
+
+
+def test_decide_tier_cline_opus_tag_routes_to_opus() -> None:
+    msgs = _cline_msgs("[opus] design a billing service")
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-opus-4-7"
+    assert "[opus]" in reason
+
+
+def test_decide_tier_cline_opus_tag_beats_complexity_classifier() -> None:
+    """[opus] takes precedence over the architecture/multi-file
+    keyword detector. The user picked the model explicitly; we
+    must not silently downgrade or reroute to the default tier."""
+    msgs = _cline_msgs(
+        "[opus] Refactor the entire authentication architecture across multiple files"
+    )
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-opus-4-7"
+    assert "[opus]" in reason
+
+
+def test_decide_tier_cline_local_tag_still_beats_opus_tag() -> None:
+    """[local] is the absolute opt-out. If the user wrote both
+    `[local]` AND `[opus]` (only one can be leading -- this tests
+    [local] leading), [local] must still win because spend safety
+    is the highest-priority invariant."""
+    # Only one tag can be at the leading position. This task has
+    # [local] leading -- it should win. (`[opus]` is mid-prompt
+    # and won't match the leading-only override regex anyway.)
+    msgs = _cline_msgs("[local] [opus] do this fast")
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "local-long"
+    assert "[local]" in reason
+
+
+def test_decide_tier_cline_claude_tag_still_routes_to_default() -> None:
+    """[claude] continues to mean 'use the default Claude tier'
+    (now Opus 4.7 via the claude-code alias), NOT a specific
+    model. Backwards-compat with existing user habits + docs."""
+    msgs = _cline_msgs("[claude] What is 2+2?")
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-code"
+    assert "[claude]" in reason
+
+
+def test_decide_tier_cline_opus_tag_is_sticky() -> None:
+    """Once a turn picks Opus, subsequent turns of the SAME task
+    (Cline replays the `<task>` verbatim across turns) stay on the
+    sticky-escalated tier so a trivial-looking follow-up tool
+    result doesn't downgrade us to local in the middle of work."""
+    task = "[opus] design a billing service"
+
+    msgs1 = _cline_msgs(task)
+    tier1, _, _ = decide_tier_cline(msgs1)
+    assert tier1 == "claude-opus-4-7"
+
+    # Cline keeps the original `<task>` envelope verbatim across
+    # turns, just appending more assistant/user pairs. Same task
+    # text -> same fingerprint -> stickiness fires. Note that
+    # sticky-rerouted turns currently land on "claude-code" (the
+    # default Claude tier) rather than re-resolving to opus; that
+    # is acceptable because the user-visible promise is "stays on
+    # a Claude tier", and the stickiness path is conservative on
+    # purpose (one code path, one model).
+    msgs2 = _cline_msgs(
+        task,
+        {"role": "assistant", "content": "Working on it."},
+        {"role": "user", "content": "[read_file] Result: looks good"},
+    )
+    tier2, reason2, _ = decide_tier_cline(msgs2)
+    assert tier2 == "claude-code"
+    assert "sticky" in reason2
+    assert "[opus]" in reason2
+
+
+def test_decide_tier_legacy_haiku_tag_routes_to_haiku() -> None:
+    """Same override behavior for non-Cline callers (CLI / curl /
+    benches) using the size-based decide_tier path."""
+    msgs = [{"role": "user", "content": "[haiku] tiny ask"}]
+    tier, reason, _ = decide_tier(msgs)
+    assert tier == "claude-haiku-4-5"
+    assert "[haiku]" in reason
+
+
+def test_decide_tier_legacy_opus_tag_beats_token_count_default() -> None:
+    """Even for a tiny prompt that would normally route to local-fast,
+    [opus] forces the upgrade."""
+    msgs = [{"role": "user", "content": "[opus] hi"}]
+    tier, _, _ = decide_tier(msgs)
+    assert tier == "claude-opus-4-7"
+
+
+def test_decide_tier_legacy_local_tag_still_beats_override_tag() -> None:
+    """Same precedence guarantee for the legacy path."""
+    # Only [local] is at the leading position (override regex is
+    # leading-only so [opus] mid-prompt doesn't match), so [local]
+    # is the one classify() picks up and we must respect it.
+    msgs = [{"role": "user", "content": "[local] do it cheap, not [opus]"}]
+    tier, _, _ = decide_tier(msgs)
+    # No-Claude promise: must not be any claude-* tier.
+    assert "claude" not in tier
+
+
+def test_pre_call_opus_tag_rewrites_model_for_cline() -> None:
+    """End-to-end through async_pre_call_hook: a Cline request with
+    a leading [opus] tag must arrive at LiteLLM with model rewritten
+    to claude-opus-4-7 so the YAML routes it to anthropic/claude-opus-4-7."""
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("[opus] design a billing service"),
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    assert new["model"] == "claude-opus-4-7"
+    meta = new["metadata"]
+    assert "[opus]" in meta["route_reason"]
+
+
+def test_pre_call_haiku_tag_rewrites_model_for_cline() -> None:
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "hybrid-auto",
+        "messages": _cline_msgs("[haiku] What is 2+2?"),
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    assert new["model"] == "claude-haiku-4-5"
+
+
+def test_pre_call_gpt_prefixed_haiku_alias_resolves() -> None:
+    """Cursor-shaped clients (`gpt-claude-haiku-4-5`) must be accepted
+    without being mistaken for an unknown model. The router strips the
+    `gpt-` prefix and lets LiteLLM route the canonical name to the
+    correct upstream."""
+    router = SizeBasedRouter()
+    data: dict[str, Any] = {
+        "model": "gpt-claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    assert new["model"] == "claude-haiku-4-5"

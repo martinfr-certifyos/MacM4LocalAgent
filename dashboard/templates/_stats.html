@@ -24,6 +24,41 @@
   {{ card("All time",      alltime) }}
 </section>
 
+{% if active %}
+<h2 class="active-heading">
+  Active
+  <span class="muted small">({{ active|length }} in flight)</span>
+</h2>
+<table class="active-table">
+  <thead>
+    <tr>
+      <th>started</th><th>tier</th><th>task</th><th>model</th>
+      <th>in (est)</th><th>elapsed</th><th>$ so far (est)</th><th>reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in active %}
+    <tr class="active-row">
+      <td>{{ "%.0f"|format(a.elapsed_sec) }}s ago</td>
+      <td><span class="tier tier-{{ a.tier }}">{{ a.tier }}</span></td>
+      <td>
+        {% if a.task_id %}
+          <a href="/tasks/{{ a.task_id }}"><code class="small">{{ a.task_id[:8] }}</code></a>
+        {% else %}
+          <span class="muted small">-</span>
+        {% endif %}
+      </td>
+      <td><code>{{ a.model }}</code></td>
+      <td>{{ "{:,}".format(a.in_tok_est) }}</td>
+      <td><b class="elapsed">{{ "%.0f"|format(a.elapsed_sec) }}s</b></td>
+      <td>${{ "%.4f"|format(a.est_cost) }}</td>
+      <td class="muted small">{{ a.route_reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <h2>Recent requests</h2>
 {% if recent %}
 <table>

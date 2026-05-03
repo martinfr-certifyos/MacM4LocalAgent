@@ -19,9 +19,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from bench import db, grader  # noqa: E402
+from cost.pricing import (  # noqa: E402
+    actual_claude_cost,
+    shadow_cost as _shadow_cost_fn,
+    sonnet_rate,
+)
 
-CLAUDE_INPUT_PER_TOKEN = 3.0 / 1_000_000
-CLAUDE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000
+# Backwards-compat constants for callers (and bench/runners/cursor_loop.py)
+# that imported these directly. Mirrors Sonnet 4.6 rates so the shadow
+# cost computed below stays the historical baseline.
+CLAUDE_INPUT_PER_TOKEN = sonnet_rate().input
+CLAUDE_OUTPUT_PER_TOKEN = sonnet_rate().output
 
 
 def _read_env(path: pathlib.Path) -> dict[str, str]:
@@ -265,12 +273,15 @@ def run_arm(
             "output_path": "",
         }
 
-    # Cost: only Claude calls hit real $.
-    is_claude = "claude" in (res.get("model_reported", "") or model).lower()
+    # Cost: only Claude calls hit real $. actual rate comes from the
+    # model id we got back (covers Opus/Haiku/Sonnet correctly);
+    # shadow stays pinned to Sonnet 4.6 for stable benchmarking.
+    reported = res.get("model_reported", "") or model
+    is_claude = "claude" in reported.lower()
     in_tok = res.get("input_tokens", 0)
     out_tok = res.get("output_tokens", 0)
-    actual = (in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN) if is_claude else 0.0
-    shadow = in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN
+    actual = actual_claude_cost(reported, in_tok, out_tok) if is_claude else 0.0
+    shadow = _shadow_cost_fn(in_tok, out_tok)
 
     row = {
         "ts": int(started),

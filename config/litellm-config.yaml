@@ -48,12 +48,43 @@ model_list:
       output_cost_per_token: 0.0
 
   - model_name: claude-code
+    # Default tier for the hybrid-auto router when it escalates to Claude.
+    # Pinned to Opus 4.7 -- the most capable model -- because anything
+    # the router escalates is by definition complex/multi-file/long-context
+    # work where the extra capability is worth the price differential.
+    # Override per-turn with [haiku] or [sonnet] tags. Pricing per token
+    # in cost.db is computed from cost/pricing.py, NOT the values below;
+    # the input/output_cost_per_token fields here only affect LiteLLM's
+    # internal /spend bookkeeping and are kept in sync as a courtesy.
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+
+  # Per-tier Claude aliases. Targets for the inline override tags
+  # ([haiku] / [sonnet] / [opus]) and for callers that want to pin
+  # a specific Claude model directly.
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+
+  - model_name: claude-sonnet-4-6
     litellm_params:
       model: anthropic/claude-sonnet-4-6
       api_key: os.environ/ANTHROPIC_API_KEY
-      # Validated at install time. Falls back to claude-sonnet-4-5 if 4-6 is unavailable.
       input_cost_per_token: 0.000003
       output_cost_per_token: 0.000015
+
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
 
   - model_name: hybrid-auto
     # Magic alias: the size-based router rewrites `data["model"]` to one of
@@ -112,11 +143,34 @@ model_list:
       output_cost_per_token: 0.0
 
   - model_name: gpt-claude-code
+    # Cursor-shaped mirror of `claude-code`. Same upstream model.
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+
+  # Cursor-shaped mirrors of the per-tier Claude aliases.
+  - model_name: gpt-claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+
+  - model_name: gpt-claude-sonnet-4-6
     litellm_params:
       model: anthropic/claude-sonnet-4-6
       api_key: os.environ/ANTHROPIC_API_KEY
       input_cost_per_token: 0.000003
       output_cost_per_token: 0.000015
+
+  - model_name: gpt-claude-opus-4-7
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
 
   - model_name: gpt-hybrid-auto
     litellm_params:

@@ -77,6 +77,32 @@ th { background: var(--panel-2); color: var(--muted); font-weight: 500; }
 tr:last-child td { border-bottom: none; }
 td code { font-size: 12px; color: var(--accent); }
 
+.active-heading {
+  color: var(--ok);
+  display: flex; align-items: center; gap: 10px;
+}
+.active-heading::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ok); box-shadow: 0 0 8px var(--ok);
+  animation: active-pulse 1.6s ease-in-out infinite;
+}
+@keyframes active-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1);   }
+  50%      { opacity: 0.4; transform: scale(0.8); }
+}
+.active-table {
+  border: 1px solid rgba(61, 220, 151, 0.35);
+}
+.active-table tr.active-row {
+  background: rgba(61, 220, 151, 0.08);
+}
+.active-table tr.active-row td {
+  border-bottom: 1px solid rgba(61, 220, 151, 0.15);
+}
+.active-table tr.active-row td b.elapsed {
+  color: var(--ok); font-variant-numeric: tabular-nums;
+}
+
 .compose textarea {
   width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #2a3344;
   background: var(--panel-2); color: var(--fg); font-family: "SF Mono", Menlo, monospace;

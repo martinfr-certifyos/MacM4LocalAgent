@@ -10,12 +10,22 @@ import sqlite3
 import time
 from typing import Any
 
+from cost.pricing import (
+    actual_claude_cost,
+    shadow_cost as _shadow_cost,
+    sonnet_rate,
+)
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DB_PATH = REPO_ROOT / "cost" / "cost.db"
 SCHEMA_PATH = REPO_ROOT / "cost" / "schema.sql"
 
-CLAUDE_INPUT_PER_TOKEN = 3.0 / 1_000_000
-CLAUDE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000
+# Backwards-compat shims: a few benchmark drivers still import the
+# old per-token constants directly. Re-export them from the canonical
+# pricing table (Sonnet 4.6 rates) so old call sites keep working.
+# New code should use cost.pricing.claude_rate() / actual_claude_cost().
+CLAUDE_INPUT_PER_TOKEN = sonnet_rate().input
+CLAUDE_OUTPUT_PER_TOKEN = sonnet_rate().output
 
 
 def connect() -> sqlite3.Connection:
@@ -58,7 +68,20 @@ def _migrate_requests_columns(conn: sqlite3.Connection) -> None:
 
 
 def shadow_cost(in_tok: int, out_tok: int) -> float:
-    return in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN
+    """Stable Sonnet-4.6 baseline. Delegates to cost.pricing.shadow_cost
+    so the shadow benchmark stays consistent across the codebase even
+    if Sonnet's published rate ever changes."""
+    return _shadow_cost(in_tok, out_tok)
+
+
+def claude_cost(model_id: str, in_tok: int, out_tok: int) -> float:
+    """Actual cost for a Claude call, looked up by model id.
+
+    Re-export of cost.pricing.actual_claude_cost so existing
+    callers can stay on the cost.ingest namespace. Returns 0.0
+    when in_tok and out_tok are both zero.
+    """
+    return actual_claude_cost(model_id, in_tok, out_tok)
 
 
 def record_request(

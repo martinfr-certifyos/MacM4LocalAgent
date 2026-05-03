@@ -23,12 +23,19 @@ import pathlib
 import re
 import sqlite3
 import sys
+import threading
 import time
 from typing import Any, Iterable
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from cost.pricing import (  # noqa: E402
+    actual_claude_cost,
+    maybe_run_pricing_check,
+    shadow_cost as _shadow_cost_fn,
+    sonnet_rate,
+)
 from router.complexity_classifier import classify  # noqa: E402
 from router.overgeneration_control import (  # noqa: E402
     _looks_like_cline,
@@ -42,9 +49,18 @@ except Exception:  # tests / standalone runs don't need LiteLLM installed
     class _LiteLLMCustomLogger:  # type: ignore[no-redef]
         pass
 
-# Anthropic claude-sonnet-4-6 published pricing (per token), used for shadow cost.
-CLAUDE_INPUT_PER_TOKEN = 3.0 / 1_000_000
-CLAUDE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000
+# Backwards-compat shims for the few external callers (and tests) that
+# still import these constants directly. They mirror the canonical
+# Sonnet 4.6 rates from cost/pricing.py and are kept in sync via
+# sonnet_rate(). New code should use actual_claude_cost() and the
+# shadow_cost helper from cost.pricing.
+CLAUDE_INPUT_PER_TOKEN = sonnet_rate().input
+CLAUDE_OUTPUT_PER_TOKEN = sonnet_rate().output
+
+# Kick off the (non-blocking, best-effort) pricing freshness check on
+# import. Safe to call: it bails immediately if it ran in the last 24h
+# or if PRICING_STARTUP_CHECK=0.
+maybe_run_pricing_check()
 
 DB_PATH = REPO_ROOT / "cost" / "cost.db"
 
@@ -227,6 +243,14 @@ def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, in
     prompt = _flat_prompt(messages)
     is_complex, why = classify(prompt)
 
+    # Per-tier Claude override beats size + complexity for non-Cline
+    # callers too (CLI, curl, benches). `[local]` is still handled by
+    # classify() above and surfaces as is_complex=False, so the size
+    # rules below apply -- which is the documented behavior.
+    override_alias, override_tag = _extract_model_override(prompt)
+    if override_alias is not None and why != "explicit [local] tag":
+        return (override_alias, f"explicit [{override_tag}] tag", tokens)
+
     if is_complex:
         return ("claude-code", f"complex: {why}", tokens)
     if tokens > ROUTE_LONG_MAX:
@@ -277,6 +301,63 @@ def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, in
 
 _CLINE_TASK_RE = re.compile(r"<task>\s*(.*?)\s*</task>", re.DOTALL | re.IGNORECASE)
 
+# ---- inline per-turn model override tags ----
+#
+# Map a leading `[tag]` on the user's task text to a specific Claude
+# alias defined in litellm-config.yaml. Lets a user say
+#   [opus] refactor the auth subsystem
+# and force Opus 4.7 for that single turn, regardless of what the
+# router would otherwise pick.
+#
+# Precedence within the routing pipeline (highest first):
+#   1. `[local]` -- absolute opt-out, beats EVERYTHING (cost safety)
+#   2. `[haiku]` / `[sonnet]` / `[opus]` -- specific Claude model
+#   3. `[claude]` -- the default Claude tier (currently Opus 4.7)
+#   4. complexity heuristics
+#   5. tool-result failure signal (Cline only)
+#   6. local-long default
+#
+# Matching is LEADING-ONLY: the tag must be the first non-whitespace
+# token. This avoids false positives from Cline's tool docs that
+# happen to contain bracketed words mid-prompt, and matches the
+# intuitive "tag your task at the start" user model documented in
+# the runbook.
+_MODEL_OVERRIDE_TAGS: dict[str, str] = {
+    "haiku":  "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus":   "claude-opus-4-7",
+}
+_OVERRIDE_TAG_RE = re.compile(
+    r"^\s*\[(haiku|sonnet|opus)\]\s*",
+    re.IGNORECASE,
+)
+
+
+def _extract_model_override(task_text: str) -> tuple[str | None, str | None]:
+    """Detect a leading `[haiku]` / `[sonnet]` / `[opus]` tag.
+
+    Returns (model_alias, tag_seen) where:
+      - model_alias is the litellm-config.yaml alias the request
+        should be rewritten to (e.g. "claude-opus-4-7"), or None
+        if no recognized tag is present at the leading position.
+      - tag_seen is the lowercase tag we matched ("opus"), used
+        for the route_reason log line; None when no match.
+
+    Whitespace before the tag is allowed; anything between the
+    closing bracket and the rest of the task is consumed too. We
+    intentionally do NOT mutate task_text -- the original survives
+    so the task fingerprint stays stable across turns even if the
+    user only added the override on turn 1.
+    """
+    if not task_text:
+        return (None, None)
+    m = _OVERRIDE_TAG_RE.match(task_text)
+    if not m:
+        return (None, None)
+    tag = m.group(1).lower()
+    return (_MODEL_OVERRIDE_TAGS[tag], tag)
+
+
 # Latest-tool-result error signatures. Match a Python traceback frame,
 # a JS stack-frame `at func (...)`, a Rust panic banner, or 3+ lines
 # starting with `error:` / `Error:` / `ERROR:` regardless of language.
@@ -285,12 +366,38 @@ _JS_STACK_RE = re.compile(r"^\s+at\s+\S+\s+\(", re.MULTILINE)
 _RUST_PANIC_RE = re.compile(r"thread '.+?' panicked at", re.IGNORECASE)
 _GENERIC_ERROR_LINE_RE = re.compile(r"^\s*(error|Error|ERROR):\s", re.MULTILINE)
 
-# Sticky escalation tracker. Maps task-fingerprint -> (timestamp, reason).
-# Entries older than _STICKY_TTL_SECONDS are evicted on read; we only
-# clean opportunistically to keep this lock-free. Memory bound: a
-# session ~40 tasks * 80 bytes/entry ~= 3 KB; not worth tuning.
+# Sticky escalation tracker.
+#
+# Maps task-fingerprint -> (timestamp, reason, remaining_turns).
+#
+# Two stickiness flavors share this dict:
+#
+#   - TIME-BOUNDED: timestamp is when the entry was created;
+#     remaining_turns is _UNBOUNDED. Entry persists until it hits
+#     _STICKY_TTL_SECONDS and is then evicted on read. Used for
+#     explicit user tags ([claude]/[opus]/etc.) and complexity-keyword
+#     escalations -- both are strong signals where the user has
+#     either explicitly accepted Claude pricing or the task content
+#     itself looks Claude-shaped. Re-evaluating those mid-task would
+#     just flap.
+#
+#   - TURN-BOUNDED: timestamp is still set so the entry can also
+#     time-expire as a safety net, but the primary expiry is
+#     remaining_turns -- each sticky-driven escalation decrements
+#     it by one, and when it hits zero the entry is evicted on
+#     read. Used for tool-result failure escalations, where the
+#     signal is heuristic ("we saw a stack trace in the latest
+#     tool response") and we want the proxy to re-evaluate after
+#     a short window. Without this, a single transient panic in
+#     a tool result would lock a task to Claude for 30 minutes
+#     even after the local model could have recovered.
+#
+# Memory bound: ~40 tasks/session * ~96 bytes/entry ~= 4 KB.
+# Not worth tuning.
 _STICKY_TTL_SECONDS = 30 * 60  # 30 min: covers a typical Cline session
-_sticky_escalations: dict[str, tuple[float, str]] = {}
+_TOOL_RESULT_STICKY_TURNS = 3  # tool-result escalations stick for this many follow-up turns
+_UNBOUNDED = -1  # sentinel: no per-turn budget; expires only on TTL
+_sticky_escalations: dict[str, tuple[float, str, int]] = {}
 
 
 def _extract_user_task(messages: Iterable[dict[str, Any]] | None) -> str | None:
@@ -338,22 +445,70 @@ def _latest_tool_result_text(messages: Iterable[dict[str, Any]] | None) -> str:
 
 
 def _looks_like_failure(text: str) -> tuple[bool, str]:
-    """Return (is_failure, reason). Conservative: requires a clear
-    runtime-error signature, not just a big text blob. Cline's normal
-    `environment_details` block is several KB on its own and we do
-    NOT want to escalate on size alone."""
+    """Return (is_failure, reason).
+
+    Conservative on purpose. We want to distinguish "the local model
+    just produced a broken artefact" (worth escalating) from "the
+    project happens to surface a stack trace in passing" (NOT worth
+    escalating to Claude because qwen3-coder-next can absolutely keep
+    handling the task structurally -- the tool result just contains
+    one piece of error-shaped text).
+
+    Requires either:
+      - >=2 instances within a single high-confidence category
+        (>=2 distinct rust panic banners OR >=2 distinct python
+        traceback frames OR >=3 JS stack frames)
+      - OR >=2 distinct error CATEGORIES at the same time
+        (e.g. a panic AND >=3 error: lines, or a python traceback
+        AND a JS stack hit)
+
+    A single panic / single traceback / single Error: line is no
+    longer enough by itself. This change was made after observing
+    a 35K-token architectural-overview task escalate to Claude (and
+    the rest of the task get stuck on Claude via stickiness) when
+    Cline's tool result merely contained one Rust panic that Qwen3
+    could have handled.
+    """
     if not text:
         return (False, "")
-    if _PY_TRACEBACK_RE.search(text):
-        return (True, "python traceback in tool result")
-    if _RUST_PANIC_RE.search(text):
-        return (True, "rust panic in tool result")
-    js_hits = len(_JS_STACK_RE.findall(text))
-    if js_hits >= 2:
-        return (True, f"js stack ({js_hits} frames) in tool result")
-    err_hits = len(_GENERIC_ERROR_LINE_RE.findall(text))
+
+    panic_hits  = len(_RUST_PANIC_RE.findall(text))
+    py_hits     = len(_PY_TRACEBACK_RE.findall(text))
+    js_hits     = len(_JS_STACK_RE.findall(text))
+    err_hits    = len(_GENERIC_ERROR_LINE_RE.findall(text))
+
+    # Categories present (at any non-zero count). Used to decide
+    # whether several distinct error sources reinforce each other.
+    categories: list[str] = []
+    if panic_hits:
+        categories.append(f"rust panic x{panic_hits}")
+    if py_hits:
+        categories.append(f"python traceback x{py_hits}")
+    if js_hits:
+        categories.append(f"js stack x{js_hits}")
+    # The error: line counter is noisy on its own (a single grep -i
+    # 'error:' against many codebases finds matches), so we require
+    # >=3 of them to even register the category. This is the same
+    # threshold the previous version used to count it as "real".
     if err_hits >= 3:
-        return (True, f"{err_hits} error: lines in tool result")
+        categories.append(f"{err_hits} error: lines")
+
+    # Strong single-category signals (high confidence): repeated
+    # frames within one category usually means a real meltdown.
+    if panic_hits >= 2:
+        return (True, f"rust panic x{panic_hits} in tool result")
+    if py_hits >= 2:
+        return (True, f"python traceback x{py_hits} in tool result")
+    if js_hits >= 3:
+        return (True, f"js stack ({js_hits} frames) in tool result")
+
+    # Cross-category corroboration: two different signals in one
+    # tool result means the failure is unlikely to be a stray.
+    if len(categories) >= 2:
+        return (True, "multiple error signals in tool result: " + ", ".join(categories))
+
+    # Single weak signal -- decline to escalate. The local model
+    # gets another turn.
     return (False, "")
 
 
@@ -367,20 +522,68 @@ def _task_fingerprint(task: str) -> str:
 
 def _check_sticky(fingerprint: str) -> str | None:
     """If the given task is already on the sticky-escalated list and
-    the entry is still fresh, return the original reason; else None.
-    Opportunistically evicts expired entries on each read."""
+    the entry is still fresh (TTL not expired AND turn budget, if
+    any, not depleted), return the original reason; else None.
+
+    Has the side effect of decrementing the turn budget by 1 each
+    time it returns a non-None reason for a turn-bounded entry --
+    i.e. each sticky-driven escalation costs one turn from the
+    budget. When the budget hits zero we evict the entry so the
+    next call re-evaluates from scratch.
+
+    Opportunistically evicts TTL-expired entries on each read.
+    """
     now = time.time()
-    expired = [k for k, (ts, _) in _sticky_escalations.items() if now - ts > _STICKY_TTL_SECONDS]
+    expired = [
+        k for k, (ts, _, _) in _sticky_escalations.items()
+        if now - ts > _STICKY_TTL_SECONDS
+    ]
     for k in expired:
         _sticky_escalations.pop(k, None)
+
     entry = _sticky_escalations.get(fingerprint)
     if entry is None:
         return None
-    return entry[1]
+
+    ts, reason, remaining = entry
+    if remaining == _UNBOUNDED:
+        # Time-bounded entry: just return the reason; TTL handles
+        # cleanup separately above.
+        return reason
+
+    # Turn-bounded: this read consumes one turn. We return the
+    # reason for the CURRENT turn (so the caller can route to
+    # Claude this time), then decrement -- if that takes us to
+    # zero, the entry is evicted so the NEXT turn re-evaluates.
+    if remaining <= 1:
+        _sticky_escalations.pop(fingerprint, None)
+    else:
+        _sticky_escalations[fingerprint] = (ts, reason, remaining - 1)
+    return reason
 
 
 def _mark_sticky(fingerprint: str, reason: str) -> None:
-    _sticky_escalations[fingerprint] = (time.time(), reason)
+    """Time-bounded sticky entry. Persists until _STICKY_TTL_SECONDS.
+
+    Use for high-confidence signals where the user has either
+    opted in (explicit `[claude]`/`[opus]`/etc. tags) or the task
+    content itself looks Claude-shaped (architecture / multi-file
+    keywords). Re-evaluating those mid-task would flap.
+    """
+    _sticky_escalations[fingerprint] = (time.time(), reason, _UNBOUNDED)
+
+
+def _mark_sticky_turns(fingerprint: str, reason: str, turns: int) -> None:
+    """Turn-bounded sticky entry. Stays sticky for at most `turns`
+    subsequent escalation reads, after which the entry self-evicts
+    and routing re-evaluates.
+
+    Use for heuristic signals (e.g. tool-result error patterns)
+    where we want to give Claude a short rescue window but NOT
+    pay Claude pricing for a half-hour just because one tool
+    response contained a stack trace.
+    """
+    _sticky_escalations[fingerprint] = (time.time(), reason, max(1, turns))
 
 
 def decide_tier_cline(
@@ -422,22 +625,46 @@ def decide_tier_cline(
             "cline+override: explicit [local] tag",
             task_tokens,
         )
+    # Per-tier Claude override: `[haiku]` / `[sonnet]` / `[opus]`.
+    # Sits below [local] (cost-safety wins) but above the complexity
+    # classifier and the [claude] default-Claude tag, so the user
+    # can force a specific model regardless of how trivial or
+    # complex the task looks. Marked sticky so subsequent turns of
+    # the same task stay on the same model (otherwise turn 2 could
+    # downgrade to local-long once the [opus] tag is no longer in
+    # the task envelope).
+    override_alias, override_tag = _extract_model_override(task)
+    if override_alias is not None:
+        reason = f"explicit [{override_tag}] tag"
+        _mark_sticky(fingerprint, reason)
+        return (
+            override_alias,
+            f"cline+override({fingerprint}): {reason}",
+            task_tokens,
+        )
     if is_complex:
         _mark_sticky(fingerprint, why)
         return ("claude-code", f"cline+task({fingerprint}): {why}", task_tokens)
 
     # Tool-result-driven escalation. Only fires on turns 2+ since
-    # turn-1 has no tool result yet. Marked sticky -- a single
-    # error trace usually means the rest of the task will also be
-    # debug-heavy, and we don't want claude pricing on the SAME
-    # task to keep flapping back to local just because turn-N+1's
-    # tool result happens to be clean.
+    # turn-1 has no tool result yet. The trigger now requires
+    # corroborating signals (see `_looks_like_failure`) so a single
+    # incidental panic doesn't move the whole task to Claude.
+    #
+    # Stickiness is TURN-BOUNDED at _TOOL_RESULT_STICKY_TURNS (3)
+    # rather than time-bounded: after a 3-turn rescue window the
+    # entry expires and routing re-evaluates. This avoids the
+    # failure mode where one bad tool result locks 30 minutes of
+    # the same task to Claude even after the local model could
+    # have recovered.
     msg_count = len(list(messages or []))
     if msg_count >= 4:  # system + task + asst + tool_result(s)
         tool_text = _latest_tool_result_text(messages)
         is_failure, fail_reason = _looks_like_failure(tool_text)
         if is_failure:
-            _mark_sticky(fingerprint, fail_reason)
+            _mark_sticky_turns(
+                fingerprint, fail_reason, _TOOL_RESULT_STICKY_TURNS,
+            )
             return (
                 "claude-code",
                 f"cline+turn({fingerprint}): {fail_reason}",
@@ -447,6 +674,50 @@ def decide_tier_cline(
     # Default: local-long. Cline's harness alone is too big for
     # local-fast, so we never pick that for Cline traffic.
     return ("local-long", f"cline+default: task={task_tokens} tok", task_tokens)
+
+
+# ----- In-flight request registry -------------------------------------------
+#
+# We keep a tiny in-memory dict of currently-running requests on the
+# SizeBasedRouter instance, populated in async_pre_call_hook and drained
+# in the success/failure hooks. The dashboard runs in a *separate*
+# process from LiteLLM, so we mirror the dict to a file (.logs/active.json)
+# after every mutation; the dashboard reads that file. This keeps the
+# bridge IPC-free and matches the existing pattern of cost.db being the
+# single shared source of truth across processes.
+ACTIVE_PATH = REPO_ROOT / ".logs" / "active.json"
+
+# Anything older than this is treated as a leaked / abandoned call and
+# swept on the next snapshot. Empirically LiteLLM always fires either a
+# success or failure hook, but a crashed worker would leave entries
+# behind without this guardrail.
+ACTIVE_TTL_SEC = 600
+
+
+def _model_to_tier(model: str) -> str:
+    """Classify a (possibly upstream-shaped) model id into one of
+    `claude` / `local-long` / `local-fast`. Pulled out of `_record` so
+    the pre-call registration can use the same logic without rewriting
+    it. Mirrors the rules documented in `_record` -- if you change one,
+    change both."""
+    m_lower = model.lower()
+    if "claude" in m_lower or "anthropic" in m_lower:
+        return "claude"
+    if (
+        model.startswith("ollama/")
+        or model == "local-long"
+        or "qwen3-coder-next" in m_lower
+        or m_lower.endswith((":q4_k_m", ":q8_0", ":q4_0"))
+    ):
+        return "local-long"
+    if (
+        model == "local-fast"
+        or model.startswith(("openai/", "mlx-"))
+        or "mlx-community" in m_lower
+        or ("/" in model and "mlx" in m_lower)
+    ):
+        return "local-fast"
+    return "local-fast"
 
 
 # ----- LiteLLM callback shim ------------------------------------------------
@@ -467,6 +738,13 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
         except Exception:
             pass
         self._conn = _ensure_db()
+        # Currently-running requests, keyed by litellm_call_id. Mutated
+        # under self._active_lock; mirrored to disk via _flush_active().
+        self._active: dict[str, dict[str, Any]] = {}
+        self._active_lock = threading.Lock()
+        # Best-effort: clear any stale snapshot from a previous proxy
+        # process so the dashboard doesn't show ghost rows on restart.
+        self._flush_active()
 
     # ------------------ pre-call: rewrite hybrid-auto -> tier ---------------
     async def async_pre_call_hook(  # type: ignore[override]
@@ -495,6 +773,9 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 "local-long",
                 "local-agent",
                 "claude-code",
+                "claude-haiku-4-5",
+                "claude-sonnet-4-6",
+                "claude-opus-4-7",
             ):
                 canonical = requested[len("gpt-"):]
                 data["model"] = canonical
@@ -571,6 +852,12 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                     pre_first_role=pre_first_role,
                     post_first_role=((data.get("messages") or [{}])[0] or {}).get("role"),
                 )
+
+            # Register this call as in-flight so the dashboard can show
+            # it. Done last in pre-call so the model/tier we record is
+            # the post-routing one. Failure here must not break the
+            # request -- the inner method already swallows exceptions.
+            self._register_active(data)
         except Exception as e:  # never break user requests
             print(f"[router] pre-call hook error: {e}", file=sys.stderr)
         return data
@@ -589,6 +876,10 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             print(f"[router] async_log_success_event error: {e}", file=sys.stderr)
 
     def _record(self, kwargs: dict[str, Any], response_obj: Any, start_time: Any, end_time: Any) -> None:
+        # Drop the in-flight registration first so the dashboard stops
+        # showing this row, even if the rest of _record errors out.
+        self._drop_active(kwargs)
+
         model = kwargs.get("model") or kwargs.get("litellm_params", {}).get("model") or "unknown"
 
         usage = {}
@@ -613,34 +904,23 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
         #     alias itself.
         #   - In other paths LiteLLM passes the upstream id (ollama/...,
         #     openai/mlx-community/..., anthropic/claude-...).
-        # We need to handle all of those.
-        m_lower = model.lower()
-        if "claude" in m_lower or "anthropic" in m_lower:
-            tier = "claude"
-        elif (
-            model.startswith("ollama/")
-            or model == "local-long"
-            or "qwen3-coder-next" in m_lower
-            or m_lower.endswith((":q4_k_m", ":q8_0", ":q4_0"))
-        ):
-            tier = "local-long"
-        elif (
-            model == "local-fast"
-            or model.startswith(("openai/", "mlx-"))
-            or "mlx-community" in m_lower
-            or "/" in model and "mlx" in m_lower
-        ):
-            tier = "local-fast"
-        else:
-            tier = "local-fast"  # default for unknown local routes
+        # The shared `_model_to_tier` helper handles all of these and is
+        # also used by the in-flight registration path.
+        tier = _model_to_tier(model)
 
-        # Actual cost: only Claude calls cost real money in this setup.
+        # Actual cost: only Claude calls cost real money. We look up the
+        # rate by the actual model id LiteLLM hands us (e.g.
+        # 'anthropic/claude-opus-4-7') so Opus, Haiku, and Sonnet are
+        # priced correctly. Unknown models fall back to Sonnet rates
+        # with a one-time stderr warning -- see cost.pricing.claude_rate.
         actual_cost = 0.0
         if tier == "claude":
-            actual_cost = in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN
+            actual_cost = actual_claude_cost(model, in_tok, out_tok)
 
-        # Shadow cost: what Claude *would* have charged for this token volume.
-        shadow_cost = in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN
+        # Shadow cost: pinned to Sonnet 4.6 so savings comparisons stay
+        # apples-to-apples across time, even if the router starts using
+        # Haiku or Opus for some requests. See cost.pricing.shadow_cost.
+        shadow_cost = _shadow_cost_fn(in_tok, out_tok)
 
         try:
             latency_ms = int((float(end_time) - float(start_time)) * 1000)
@@ -691,6 +971,136 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             ),
         )
         self._conn.commit()
+
+    # ------------------ failure: drain in-flight registration ---------------
+    def log_failure_event(  # type: ignore[override]
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+    ) -> None:
+        """Sync failure hook. Drops the in-flight entry so a 4xx/5xx
+        from upstream doesn't leak into the dashboard's Active list.
+        We don't write a row to `requests` for failures -- that's
+        consistent with prior behavior (only successes are billed)."""
+        try:
+            self._drop_active(kwargs)
+        except Exception as e:
+            print(f"[router] log_failure_event error: {e}", file=sys.stderr)
+
+    async def async_log_failure_event(  # type: ignore[override]
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+    ) -> None:
+        try:
+            self._drop_active(kwargs)
+        except Exception as e:
+            print(f"[router] async_log_failure_event error: {e}", file=sys.stderr)
+
+    # ------------------ in-flight registry helpers --------------------------
+    @staticmethod
+    def _extract_call_id(source: dict[str, Any]) -> str | None:
+        """Find the LiteLLM call id in any of the locations LiteLLM uses
+        across its lifecycle. None if the request predates call-id
+        plumbing (older LiteLLM) -- in that case we generate a synthetic
+        one in `_register_active` so the row still shows up."""
+        cid = source.get("litellm_call_id")
+        if cid:
+            return cid
+        meta = source.get("metadata") or {}
+        cid = meta.get("litellm_call_id")
+        if cid:
+            return cid
+        params = source.get("litellm_params") or {}
+        cid = params.get("litellm_call_id")
+        if cid:
+            return cid
+        nested_meta = params.get("metadata") or {}
+        return nested_meta.get("litellm_call_id")
+
+    def _register_active(self, data: dict[str, Any]) -> None:
+        """Add an entry to the in-flight registry. Called at the end of
+        the pre-call hook, after routing + over-gen control have run, so
+        the model/tier we record is the post-routing one.
+
+        Never raises -- a failure here must not break a user request."""
+        try:
+            cid = self._extract_call_id(data) or f"anon-{time.time_ns()}"
+            meta = data.get("metadata") or {}
+            model = data.get("model", "")
+            entry = {
+                "started": time.time(),
+                "model": model,
+                "tier": _model_to_tier(model),
+                "in_tok_est": int(meta.get("route_tokens_estimated", 0) or 0),
+                "task_id": meta.get("task_id"),
+                "task_text_short": (meta.get("task_text") or "")[:80],
+                "route_reason": meta.get("route_reason", ""),
+            }
+            with self._active_lock:
+                self._active[cid] = entry
+            self._flush_active()
+        except Exception as e:
+            print(f"[router] _register_active error: {e}", file=sys.stderr)
+
+    def _drop_active(self, kwargs: dict[str, Any]) -> None:
+        """Remove an entry from the in-flight registry. Called from
+        success and failure hooks. Tolerates missing call-ids and
+        already-dropped entries silently."""
+        try:
+            cid = self._extract_call_id(kwargs)
+            if not cid:
+                return
+            with self._active_lock:
+                self._active.pop(cid, None)
+            self._flush_active()
+        except Exception as e:
+            print(f"[router] _drop_active error: {e}", file=sys.stderr)
+
+    def snapshot_active(self) -> list[dict[str, Any]]:
+        """Return a stable list of currently-running calls. Sweeps any
+        entry older than ACTIVE_TTL_SEC -- defensive in case LiteLLM
+        ever drops a call without firing either hook (a crashed worker,
+        for instance)."""
+        now = time.time()
+        with self._active_lock:
+            stale = [
+                cid for cid, v in self._active.items()
+                if now - v.get("started", now) > ACTIVE_TTL_SEC
+            ]
+            for cid in stale:
+                self._active.pop(cid, None)
+            out = [
+                {**v, "call_id": cid, "elapsed_sec": now - v.get("started", now)}
+                for cid, v in self._active.items()
+            ]
+        if stale:
+            # Persist the post-sweep state so the dashboard reflects it
+            # on the very next poll.
+            self._flush_active()
+        return out
+
+    def _flush_active(self) -> None:
+        """Mirror the in-memory dict to ACTIVE_PATH so the dashboard
+        process (separate launchd plist) can read it. Atomic via
+        write-rename so a concurrent reader never sees a half-written
+        file. Never raises."""
+        try:
+            ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with self._active_lock:
+                payload = [
+                    {**v, "call_id": cid}
+                    for cid, v in self._active.items()
+                ]
+            tmp = ACTIVE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, ACTIVE_PATH)
+        except Exception as e:
+            print(f"[router] active flush failed: {e}", file=sys.stderr)
 
 
 # Module-level instance so LiteLLM can import either the class or this object.

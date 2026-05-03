@@ -47,6 +47,13 @@ sys.path.insert(0, str(REPO_ROOT))
 from bench import db, grader  # noqa: E402
 from bench.runners import litellm_arm  # noqa: E402
 
+from cost.pricing import (  # noqa: E402
+    actual_claude_cost,
+    shadow_cost as _shadow_cost_fn,
+)
+
+# Backwards-compat: a couple of older imports look up these names on the
+# module. Mirror Sonnet 4.6 rates from the canonical pricing table.
 CLAUDE_INPUT_PER_TOKEN = litellm_arm.CLAUDE_INPUT_PER_TOKEN
 CLAUDE_OUTPUT_PER_TOKEN = litellm_arm.CLAUDE_OUTPUT_PER_TOKEN
 RESULTS = REPO_ROOT / "bench" / "results"
@@ -135,9 +142,22 @@ def _is_claude(model: str, reported: str | None) -> bool:
     return "claude" in (reported or model or "").lower()
 
 
-def _cost(in_tok: int, out_tok: int, *, claude: bool) -> tuple[float, float]:
-    shadow = in_tok * CLAUDE_INPUT_PER_TOKEN + out_tok * CLAUDE_OUTPUT_PER_TOKEN
-    actual = shadow if claude else 0.0
+def _cost(
+    in_tok: int,
+    out_tok: int,
+    *,
+    claude: bool,
+    model_id: str = "claude-sonnet-4-6",
+) -> tuple[float, float]:
+    """Return (actual_usd, shadow_usd).
+
+    `actual` is what we'd really pay for this Claude model (Opus and
+    Haiku price differently from Sonnet). `shadow` stays pinned to
+    Sonnet 4.6 so the savings benchmark is comparable across runs.
+    For non-Claude calls actual=0.
+    """
+    shadow = _shadow_cost_fn(in_tok, out_tok)
+    actual = actual_claude_cost(model_id, in_tok, out_tok) if claude else 0.0
     return actual, shadow
 
 
@@ -345,7 +365,7 @@ def run_loop(
         in_tok = turn_summary["input_tokens"]
         out_tok = turn_summary["output_tokens"]
         claude = _is_claude(model, model)
-        actual, shadow = _cost(in_tok, out_tok, claude=claude)
+        actual, shadow = _cost(in_tok, out_tok, claude=claude, model_id=model)
         # For turn 2 we want the merged composite (i.e. counting prior
         # files that didn't need re-emitting). For turn 1 it's the same.
         comp = float(turn_summary["composite_score"])

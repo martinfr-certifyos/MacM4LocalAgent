@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import time
 
 import httpx
@@ -17,6 +18,16 @@ from dashboard import app as dash_app
 @pytest.fixture
 def client(tmp_db) -> TestClient:                                              # noqa: ARG001
     return TestClient(dash_app.app)
+
+
+@pytest.fixture
+def tmp_active(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Redirect the dashboard's view of `.logs/active.json` to a tmp file.
+    Lets each test seed its own fixture without racing the real proxy
+    or other tests."""
+    path = tmp_path / "active.json"
+    monkeypatch.setattr(dash_app, "ACTIVE_PATH", path, raising=True)
+    return path
 
 
 def _seed(now: int) -> None:
@@ -228,3 +239,123 @@ def test_stats_recent_table_links_to_task(client: TestClient) -> None:
     assert 'href="/tasks/abc123def4567890"' in r.text
     # Non-Cline row: dash placeholder.
     assert "<span class=\"muted small\">-</span>" in r.text
+
+
+# ---- /stats Active panel -----------------------------------------------------
+#
+# The router process writes .logs/active.json after every in-flight
+# mutation; the dashboard reads it on every poll. The tests below
+# stub that file directly to avoid spinning up the LiteLLM proxy.
+
+def _seed_active_file(path: pathlib.Path, *, started_offset: float = -3.0) -> None:
+    """Write a single in-flight Cline row that started `started_offset`
+    seconds ago (negative = in the past). Picked to look like a real
+    Cline turn routed to local-long."""
+    payload = [{
+        "call_id": "abc-call-id-9999",
+        "started": time.time() + started_offset,
+        "model": "ollama/qwen3-coder-next:q4_K_M",
+        "tier": "local-long",
+        "in_tok_est": 12345,
+        "task_id": "abc123def4567890",
+        "task_text_short": "Add a one-line comment to README.md",
+        "route_reason": "cline-mode: cline+default: task=8 tok",
+    }]
+    path.write_text(json.dumps(payload))
+
+
+def test_stats_active_panel_hidden_when_no_active(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """No file -> no Active heading. The whole panel is wrapped in
+    `{% if active %}` so the recent-requests table stays at the top
+    when nothing is in flight."""
+    # tmp_active fixture pinned the path; we deliberately don't seed it.
+    r = client.get("/stats")
+    assert r.status_code == 200
+    assert "Active" not in r.text or "active-heading" not in r.text
+
+
+def test_stats_active_panel_renders_in_flight_row(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """A seeded active row should render with the model, tier badge,
+    elapsed-time column, and a link back to the task page."""
+    _seed_active_file(tmp_active, started_offset=-7.0)
+
+    r = client.get("/stats")
+    assert r.status_code == 200
+    # Heading + count badge.
+    assert "active-heading" in r.text
+    assert "1 in flight" in r.text
+    # Row content: model, tier, deep-link to /tasks/<id>.
+    assert "ollama/qwen3-coder-next" in r.text
+    assert "tier-local-long" in r.text
+    assert 'href="/tasks/abc123def4567890"' in r.text
+    # Token estimate is rendered with thousands-separator formatting.
+    assert "12,345" in r.text
+
+
+def test_stats_active_cost_zero_for_local(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """Local tiers cost nothing in flight or out. The estimated cost
+    column must show $0.0000 to avoid scaring the user."""
+    _seed_active_file(tmp_active)
+    r = client.get("/stats")
+    assert r.status_code == 200
+    # The Active row must contain a $0.0000 cell. Other rows' costs are
+    # also formatted to 4dp so we just assert presence here.
+    assert "$0.0000" in r.text
+
+
+def test_stats_active_cost_nonzero_for_claude(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """Claude calls have a lower-bound cost based on the input-token
+    estimate at the canonical Sonnet rate. 1,000,000 in_tok_est at
+    $3 / 1M = $3.00."""
+    payload = [{
+        "call_id": "claude-cid",
+        "started": time.time() - 2.0,
+        "model": "anthropic/claude-sonnet-4-6",
+        "tier": "claude",
+        "in_tok_est": 1_000_000,
+        "task_id": None,
+        "task_text_short": "",
+        "route_reason": "complex; tokens 5",
+    }]
+    tmp_active.write_text(json.dumps(payload))
+
+    r = client.get("/stats")
+    assert r.status_code == 200
+    # $3.0000 = 1M tokens * $3/1M (Sonnet input rate).
+    assert "$3.0000" in r.text
+
+
+def test_api_stats_includes_active(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """/api/stats JSON must surface the same active list the HTML
+    fragment does, so external tools (statusline scripts, etc.) can
+    poll it without scraping HTML."""
+    _seed_active_file(tmp_active)
+
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert "active" in body
+    assert len(body["active"]) == 1
+    assert body["active"][0]["call_id"] == "abc-call-id-9999"
+    assert body["active"][0]["elapsed_sec"] >= 0
+
+
+def test_api_stats_active_empty_when_file_missing(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """The dashboard must boot even if the proxy hasn't written the
+    file yet (cold-start ordering). Empty list, not a 500."""
+    # tmp_active path doesn't exist on disk yet.
+    assert not tmp_active.exists()
+
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    assert r.json()["active"] == []
+
+
+def test_api_stats_active_empty_on_garbage_file(client: TestClient, tmp_active: pathlib.Path) -> None:
+    """A half-written file (race between write and read) must not crash
+    the dashboard. We swallow JSON errors and return an empty list."""
+    tmp_active.write_text("{not valid json")
+
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    assert r.json()["active"] == []

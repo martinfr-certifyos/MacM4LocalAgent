@@ -102,8 +102,9 @@ def test_run_arm_claude_charges_actual(tmp_db, synthetic_task,
         arm="claude-only", model="claude-code",
         task=synthetic_task, work_dir=work,
     )
-    # 1000*3e-6 + 500*15e-6 = 0.003 + 0.0075 = 0.0105
-    assert row["actual_cost"] == pytest.approx(0.0105, rel=1e-6)
+    # `claude-code` is the proxy's default Claude tier -- currently Opus 4.7.
+    # 1000*5e-6 + 500*25e-6 = 0.005 + 0.0125 = 0.0175
+    assert row["actual_cost"] == pytest.approx(0.0175, rel=1e-6)
     assert row["arm"] == "claude-only"
 
 
