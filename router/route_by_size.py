@@ -37,6 +37,13 @@ from cost.pricing import (  # noqa: E402
     sonnet_rate,
 )
 from router.complexity_classifier import classify  # noqa: E402
+from router.offline_mode import (  # noqa: E402
+    DEFAULT_OFFLINE_FALLBACK,
+    OfflineStrictReject,
+    is_offline,
+    maybe_downgrade,
+    offline_reason,
+)
 from router.overgeneration_control import (  # noqa: E402
     _looks_like_cline,
     apply_multi_turn_tighten,
@@ -238,10 +245,19 @@ def _flat_prompt(messages: Iterable[dict[str, Any]] | None) -> str:
 
 
 def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, int]:
-    """Return (model_name, reason, estimated_tokens)."""
+    """Return (model_name, reason, estimated_tokens).
+
+    Offline awareness: if `is_offline()` returns True at the point of
+    decision, we never return a Claude tier. Explicit `[claude]/[opus]/
+    [sonnet]/[haiku]` tags are still recognized but downgraded with a
+    descriptive reason so the cost ledger reflects WHY we ignored the
+    user's pin. The async_pre_call_hook applies the same guard as a
+    final chokepoint for direct claude-* model selections that never
+    pass through decide_tier()."""
     tokens = _estimate_tokens(messages)
     prompt = _flat_prompt(messages)
     is_complex, why = classify(prompt)
+    offline_now = is_offline()
 
     # Per-tier Claude override beats size + complexity for non-Cline
     # callers too (CLI, curl, benches). `[local]` is still handled by
@@ -249,11 +265,29 @@ def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, in
     # rules below apply -- which is the documented behavior.
     override_alias, override_tag = _extract_model_override(prompt)
     if override_alias is not None and why != "explicit [local] tag":
+        if offline_now:
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"offline-downgrade ({offline_reason()}); ignored [{override_tag}] tag",
+                tokens,
+            )
         return (override_alias, f"explicit [{override_tag}] tag", tokens)
 
     if is_complex:
+        if offline_now:
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"offline-downgrade ({offline_reason()}); would have been complex: {why}",
+                tokens,
+            )
         return ("claude-code", f"complex: {why}", tokens)
     if tokens > ROUTE_LONG_MAX:
+        if offline_now:
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"offline-downgrade ({offline_reason()}); tokens {tokens} > {ROUTE_LONG_MAX}",
+                tokens,
+            )
         return ("claude-code", f"tokens {tokens} > {ROUTE_LONG_MAX}", tokens)
     if tokens > ROUTE_FAST_MAX:
         return ("local-long", f"tokens {tokens} in [{ROUTE_FAST_MAX},{ROUTE_LONG_MAX}]", tokens)
@@ -604,9 +638,21 @@ def decide_tier_cline(
 
     task_tokens = max(1, len(task) // 4)
     fingerprint = _task_fingerprint(task)
+    offline_now = is_offline()
 
     sticky_reason = _check_sticky(fingerprint)
     if sticky_reason is not None:
+        if offline_now:
+            # Sticky entry would have sent us to Claude, but we're
+            # offline now. Don't evict the entry -- it's still
+            # informative for when the network returns -- just
+            # downgrade THIS turn.
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"cline+offline-downgrade({fingerprint}): {offline_reason()}; "
+                f"would have been: {sticky_reason}",
+                task_tokens,
+            )
         return (
             "claude-code",
             f"cline+sticky({fingerprint}): {sticky_reason}",
@@ -636,6 +682,17 @@ def decide_tier_cline(
     override_alias, override_tag = _extract_model_override(task)
     if override_alias is not None:
         reason = f"explicit [{override_tag}] tag"
+        if offline_now:
+            # Don't mark sticky -- when we come back online we want
+            # the [opus] tag to take effect properly. The user
+            # explicitly asked for Claude; this turn just can't
+            # honor it.
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"cline+offline-downgrade({fingerprint}): {offline_reason()}; "
+                f"ignored {reason}",
+                task_tokens,
+            )
         _mark_sticky(fingerprint, reason)
         return (
             override_alias,
@@ -643,6 +700,13 @@ def decide_tier_cline(
             task_tokens,
         )
     if is_complex:
+        if offline_now:
+            return (
+                DEFAULT_OFFLINE_FALLBACK,
+                f"cline+offline-downgrade({fingerprint}): {offline_reason()}; "
+                f"would have been complex: {why}",
+                task_tokens,
+            )
         _mark_sticky(fingerprint, why)
         return ("claude-code", f"cline+task({fingerprint}): {why}", task_tokens)
 
@@ -662,6 +726,17 @@ def decide_tier_cline(
         tool_text = _latest_tool_result_text(messages)
         is_failure, fail_reason = _looks_like_failure(tool_text)
         if is_failure:
+            if offline_now:
+                # Tool-result failure rescue requires Claude; we
+                # can't do that offline. Stay on local-long and
+                # log the would-have-been reason for the audit
+                # trail.
+                return (
+                    DEFAULT_OFFLINE_FALLBACK,
+                    f"cline+offline-downgrade({fingerprint}): {offline_reason()}; "
+                    f"would have been: {fail_reason}",
+                    task_tokens,
+                )
             _mark_sticky_turns(
                 fingerprint, fail_reason, _TOOL_RESULT_STICKY_TURNS,
             )
@@ -813,6 +888,40 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                         # only as a preview on /tasks.
                         meta["task_text"] = task_text[:500]
 
+            # Offline-mode chokepoint. Runs AFTER routing so it catches
+            # both `hybrid-auto`-driven Claude decisions AND direct
+            # claude-* model selections that never went through
+            # decide_tier(). The helper mutates `data` in place: it
+            # rewrites `data["model"]` to local-long and stamps
+            # `metadata.offline_downgrade` for the cost ledger.
+            #
+            # `requested` here is the post-gpt-stripped alias the user
+            # asked for ("claude-code", "claude-opus-4-7", "hybrid-auto",
+            # ...). We pass it as `requested_alias` so the user-visible
+            # warning reads naturally even when the routing rewrote the
+            # model already.
+            #
+            # `explicit_claude` flips strict-mode rejection on, so a
+            # user who said `claude-opus-4-7` by name on an airplane
+            # gets a clear 503 instead of a silent (and possibly
+            # confusing) local result.
+            explicit_claude = (
+                requested.startswith("claude-")
+                or requested == "claude-code"
+            )
+            downgraded, error_msg = maybe_downgrade(
+                data,
+                requested_alias=requested,
+                explicit_claude=explicit_claude,
+            )
+            if downgraded and error_msg:
+                # Strict-mode rejection. Raising a sentinel subclass
+                # of RuntimeError lets the outer try/except below
+                # re-raise this specifically (so LiteLLM returns a
+                # 503 to the client) instead of swallowing it like
+                # an unexpected routing error.
+                raise OfflineStrictReject(error_msg)
+
             # Over-generation controls run AFTER the hybrid-auto rewrite
             # so the controls can see the resolved model name. Both
             # strategies are no-ops for non-local models and for
@@ -858,6 +967,12 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             # the post-routing one. Failure here must not break the
             # request -- the inner method already swallows exceptions.
             self._register_active(data)
+        except OfflineStrictReject:
+            # Strict-mode rejection is intentional: re-raise so
+            # LiteLLM returns a 503 to the client. The metadata was
+            # already stamped on `data` by maybe_downgrade(), and
+            # _log_event() recorded the rejection in the audit log.
+            raise
         except Exception as e:  # never break user requests
             print(f"[router] pre-call hook error: {e}", file=sys.stderr)
         return data
