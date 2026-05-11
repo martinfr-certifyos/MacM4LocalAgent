@@ -8,7 +8,7 @@ LAUNCHD_DIR := $(REPO_ROOT)/launchd
 LAUNCH_AGENTS := $(HOME)/Library/LaunchAgents
 PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard
 
-.PHONY: help detect install start stop restart status dashboard verify report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline
+.PHONY: help detect install start stop restart status dashboard verify report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline offline online offline-status
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -110,6 +110,21 @@ report: ## Print savings report (today / 7d / MTD)
 check-pricing: ## Diff cost/pricing.py against Anthropic's published rates (no auto-write)
 	@. $(REPO_ROOT)/.venvs/litellm/bin/activate 2>/dev/null || true; \
 	python3 $(REPO_ROOT)/scripts/check_claude_pricing.py
+
+# ---------- offline mode (airplane / no-network sessions) ----------
+#
+# Toggles the OFFLINE flag in config/detected.env. The router reads
+# this on every call (no proxy restart required) and downgrades any
+# Claude tier to local-long. See docs/offline-mode.md.
+
+offline: ## Force offline mode (no Claude calls) - persists across restarts
+	@bash $(SCRIPTS)/offline-mode.sh on
+
+online: ## Disable forced offline mode (back to auto-detect)
+	@bash $(SCRIPTS)/offline-mode.sh off
+
+offline-status: ## Show current offline-mode state + live probe result
+	@bash $(SCRIPTS)/offline-mode.sh status
 
 compare: ## Run an A/B comparison: make compare PROMPT="..."
 	@if [ -z "$${PROMPT:-}" ]; then echo 'Usage: make compare PROMPT="..."'; exit 1; fi
