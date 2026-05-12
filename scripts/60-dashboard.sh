@@ -34,9 +34,10 @@ MLX_LOCAL_DIR="${MLX_LOCAL_DIR:-$REPO_ROOT/models/mlx}"
 : "${KV_CACHE_TYPE:=q4_0}"
 : "${OLLAMA_NUM_PARALLEL:=1}"
 : "${OLLAMA_KEEP_ALIVE:=30m}"
+: "${OLLAMA_PORT:=11434}"
+: "${OLLAMA_TAG:=qwen3-coder-next:q4_K_M}"
 
 for src in "$REPO_ROOT"/launchd/*.plist; do
-  # Skip the rendered output if we run twice.
   case "$src" in *.rendered.plist) continue;; esac
   out="${src%.plist}.rendered.plist"
   sed -e "s|@@REPO_ROOT@@|$REPO_ROOT|g" \
@@ -44,6 +45,8 @@ for src in "$REPO_ROOT"/launchd/*.plist; do
       -e "s|@@KV_CACHE_TYPE@@|$KV_CACHE_TYPE|g" \
       -e "s|@@OLLAMA_NUM_PARALLEL@@|$OLLAMA_NUM_PARALLEL|g" \
       -e "s|@@OLLAMA_KEEP_ALIVE@@|$OLLAMA_KEEP_ALIVE|g" \
+      -e "s|@@OLLAMA_PORT@@|$OLLAMA_PORT|g" \
+      -e "s|@@OLLAMA_TAG@@|$OLLAMA_TAG|g" \
       "$src" > "$out"
   log "rendered $(basename "$out") (KV=$KV_CACHE_TYPE, parallel=$OLLAMA_NUM_PARALLEL, keep_alive=$OLLAMA_KEEP_ALIVE)"
 done
