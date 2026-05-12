@@ -49,6 +49,14 @@ LOCAL_MAX_TOKENS_DEFAULT = 6144
 # operating under (~2k tokens per fix-up) plus a margin.
 LOCAL_MAX_TOKENS_FIXUP = 3072
 
+# Cline's Plan mode produces a single `<plan_mode_respond>` block of
+# conversational text. There is no code to emit, no file edit, no
+# tool chain. A well-formed plan response is typically 200-800 tokens.
+# Cap at 1024 to leave a small margin while preventing the model from
+# padding the response with implementation code it isn't supposed to
+# write yet.
+LOCAL_MAX_TOKENS_PLAN = 1024
+
 # The "you have already started a second file fence" stop pattern. The
 # grader format we use is ```python:<filename>\n...\n```. After the
 # first complete file, a second `\n```python:` is the model deciding to
@@ -135,6 +143,14 @@ _CLINE_SYSTEM_FINGERPRINTS = (
     "<attempt_completion>",
 )
 
+# Cline's Plan mode is detected via the system-prompt mention of the
+# plan_mode_respond tool. When Cline is in Plan mode it constrains
+# itself to only emit a `<plan_mode_respond>` block; when in Act mode
+# it can use any tool. The plan_mode_respond tool description only
+# appears in the system prompt when Plan mode is active, so a single
+# substring match is a reliable detector.
+_CLINE_PLAN_MODE_FINGERPRINT = "plan_mode_respond"
+
 
 def _looks_like_cline(messages: Any) -> bool:
     """Return True if the request shape matches Cline's harness.
@@ -151,6 +167,25 @@ def _looks_like_cline(messages: Any) -> bool:
     if not text:
         return False
     return any(fp in text for fp in _CLINE_SYSTEM_FINGERPRINTS)
+
+
+def _looks_like_cline_plan_mode(messages: Any) -> bool:
+    """Return True if a Cline request is in Plan mode (vs Act mode).
+
+    Detected via the system-prompt mention of `plan_mode_respond` --
+    the tool is only documented in the system prompt when Plan mode
+    is active. Returns False for any non-Cline request shape.
+
+    Why this matters: Plan mode produces only conversational text
+    inside a `<plan_mode_respond>` block, never code, never edits.
+    Tighter `max_tokens` here saves wall time without truncating
+    legitimate output.
+    """
+    if not _looks_like_cline(messages):
+        return False
+    assert isinstance(messages, list)  # narrowed by _looks_like_cline
+    text = _content_text(messages[0].get("content"))
+    return _CLINE_PLAN_MODE_FINGERPRINT in text
 
 
 def _content_text(content: Any) -> str:
@@ -230,12 +265,17 @@ def apply_static_guardrail(
         if only_for_local and not _is_local(data.get("model")):
             return data
 
-        # Clamp max_tokens.
-        existing_max = data.get("max_tokens")
-        if existing_max is None or int(existing_max) > max_tokens:
-            data["max_tokens"] = int(max_tokens)
+        messages = data.get("messages")
+        is_cline = _looks_like_cline(messages)
+        is_plan = is_cline and _looks_like_cline_plan_mode(messages)
 
-        is_cline = _looks_like_cline(data.get("messages"))
+        # Clamp max_tokens. Plan mode gets a tighter cap because plan
+        # responses are conversational, never contain code, and rarely
+        # exceed 800 tokens of legitimate output.
+        effective_cap = LOCAL_MAX_TOKENS_PLAN if is_plan else max_tokens
+        existing_max = data.get("max_tokens")
+        if existing_max is None or int(existing_max) > effective_cap:
+            data["max_tokens"] = int(effective_cap)
 
         # Extend stop sequences. Cline traffic gets the tool-close-tag
         # set; everything else gets the python-fence default.

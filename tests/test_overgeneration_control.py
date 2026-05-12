@@ -429,3 +429,73 @@ def test_cline_stop_sequences_constant_shape() -> None:
         "</read_file>",
         "</attempt_completion>",
     ]
+
+
+# ---- Plan / Act mode detection + plan max_tokens cap ---------------------
+
+def _cline_plan_mode_messages() -> list[dict[str, Any]]:
+    """A Cline system prompt that documents the plan_mode_respond tool."""
+    sysprompt = (
+        "You are Cline, a highly skilled software engineer. "
+        "Use <replace_in_file>...</replace_in_file> to modify files. "
+        "## plan_mode_respond\n"
+        "Description: Respond to the user's question or message in PLAN MODE..."
+    )
+    return [
+        {"role": "system", "content": sysprompt},
+        {"role": "user", "content": "<task>Design a billing service</task>"},
+    ]
+
+
+def test_looks_like_cline_plan_mode_true_when_tool_in_system() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode(_cline_plan_mode_messages()) is True
+
+
+def test_looks_like_cline_plan_mode_false_in_act_mode() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode(_cline_messages()) is False
+
+
+def test_looks_like_cline_plan_mode_false_for_non_cline() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode([
+        {"role": "user", "content": "plan_mode_respond just a word"}
+    ]) is False
+
+
+def test_static_guardrail_caps_plan_mode_at_1024() -> None:
+    """Plan mode requests get LOCAL_MAX_TOKENS_PLAN (1024) instead of
+    the default 6144 ceiling."""
+    from router.overgeneration_control import LOCAL_MAX_TOKENS_PLAN
+    data = {
+        "model": "local-long",
+        "messages": _cline_plan_mode_messages(),
+        "max_tokens": 8192,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == LOCAL_MAX_TOKENS_PLAN
+
+
+def test_static_guardrail_act_mode_keeps_default_cap() -> None:
+    """Act-mode Cline traffic still uses LOCAL_MAX_TOKENS_DEFAULT."""
+    from router.overgeneration_control import LOCAL_MAX_TOKENS_DEFAULT
+    data = {
+        "model": "local-long",
+        "messages": _cline_messages(),
+        "max_tokens": 8192,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == LOCAL_MAX_TOKENS_DEFAULT
+
+
+def test_static_guardrail_plan_mode_does_not_raise_lower_cap() -> None:
+    """If a caller already pinned max_tokens below our plan cap, leave
+    it alone."""
+    data = {
+        "model": "local-long",
+        "messages": _cline_plan_mode_messages(),
+        "max_tokens": 256,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == 256
