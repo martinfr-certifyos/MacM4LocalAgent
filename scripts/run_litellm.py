@@ -66,4 +66,10 @@ import router.route_by_size  # noqa: F401,E402
 from litellm import run_server  # noqa: E402
 
 if __name__ == "__main__":
-    sys.exit(run_server())
+    # Pass argv explicitly through Click's main() to defeat a regression in
+    # newer click/uvicorn pairings where `run_server()`'s implicit __call__
+    # resolves --port to an ephemeral instead of the value on the command
+    # line. Without this, launchd would bring the proxy up on a random
+    # high port and `make status` would report it DOWN. See:
+    # https://click.palletsprojects.com/en/stable/api/#click.BaseCommand.main
+    sys.exit(run_server.main(args=sys.argv[1:], prog_name="run_litellm"))

@@ -466,12 +466,39 @@ def _probe_ollama_loaded_models() -> set[str]:
         return set()
 
 
+def _resolve_ollama_tag() -> str:
+    """Return the tag the operator expects Ollama to be running.
+
+    Prefers an explicit OLLAMA_TAG env var (matches the launchd plist
+    contract), but falls back to config/detected.env so the warm probe
+    still works when the dashboard process inherits a stripped
+    environment (e.g. manual invocation, login-shell quirks)."""
+    import os
+    explicit = os.environ.get("OLLAMA_TAG", "").strip()
+    if explicit:
+        return explicit
+    try:
+        env_path = pathlib.Path(__file__).resolve().parent.parent / "config" / "detected.env"
+        if not env_path.is_file():
+            return ""
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            if key.strip() == "OLLAMA_TAG":
+                val = val.strip().strip('"').strip("'")
+                return val
+    except Exception:
+        pass
+    return ""
+
+
 def _macm4_models_payload() -> dict[str, Any]:
     """Build the response body. Centralised so tests can call it
     without spinning up the ASGI app."""
-    import os
     loaded_ollama = _probe_ollama_loaded_models()
-    expected_ollama = os.environ.get("OLLAMA_TAG", "")
+    expected_ollama = _resolve_ollama_tag()
 
     models: list[dict[str, Any]] = []
     for tier in _MACM4_TIERS:
