@@ -71,7 +71,17 @@ if [[ -n "$REQUESTED_KV" && "$REQUESTED_KV" != f16 && "$EFFECTIVE_KV" != "$REQUE
   fail "KV cache mismatch: requested '$REQUESTED_KV' but daemon does not support it (effective: '$EFFECTIVE_KV'). Run \`make detect && make finalize\` to re-pick a supported type."
 fi
 
-if [[ "${OLLAMA_FLASH_ATTENTION:-$(launchctl getenv OLLAMA_FLASH_ATTENTION 2>/dev/null)}" == "1" ]]; then
+# Check OLLAMA_FLASH_ATTENTION from the running process env first, then
+# fall back to reading the launchd plist (the env var is set per-plist, not
+# globally, so `launchctl getenv` misses it).
+_FLASH_VAL="${OLLAMA_FLASH_ATTENTION:-$(launchctl getenv OLLAMA_FLASH_ATTENTION 2>/dev/null)}"
+if [[ -z "$_FLASH_VAL" ]]; then
+  _OLLAMA_PLIST=~/Library/LaunchAgents/com.local.ollama.plist
+  if [[ -f "$_OLLAMA_PLIST" ]]; then
+    _FLASH_VAL="$(plutil -extract EnvironmentVariables.OLLAMA_FLASH_ATTENTION raw "$_OLLAMA_PLIST" 2>/dev/null || true)"
+  fi
+fi
+if [[ "$_FLASH_VAL" == "1" ]]; then
   ok "OLLAMA_FLASH_ATTENTION=1 (required for q4_0/q8_0/tq3)"
 else
   case "$EFFECTIVE_KV" in
