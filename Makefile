@@ -6,9 +6,9 @@ REPO_ROOT := $(shell pwd)
 SCRIPTS := $(REPO_ROOT)/scripts
 LAUNCHD_DIR := $(REPO_ROOT)/launchd
 LAUNCH_AGENTS := $(HOME)/Library/LaunchAgents
-PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard com.local.ollama-warm
+PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard com.local.ollama-warm com.local.watchdog
 
-.PHONY: help detect install start stop restart status dashboard verify report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline warm
+.PHONY: help detect install start stop restart status dashboard verify watchdog report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline warm
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -99,6 +99,9 @@ dashboard: ## Open the cost/savings dashboard
 
 verify: ## Run endpoint health + smoke matrix
 	@bash $(SCRIPTS)/90-verify.sh
+
+watchdog: ## Run orphaned-task cleanup once (use --status for dry-run)
+	@bash $(SCRIPTS)/95-watchdog.sh $(ARGS)
 
 cline: ## Install the Cline extension into Cursor (or VS Code as fallback)
 	@bash $(SCRIPTS)/install-cline.sh
