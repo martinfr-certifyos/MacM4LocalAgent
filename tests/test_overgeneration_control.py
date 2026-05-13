@@ -421,11 +421,184 @@ def test_multi_turn_tighten_no_op_for_cline() -> None:
 
 def test_cline_stop_sequences_constant_shape() -> None:
     """Pin the exact stop list so accidental edits to the constant get
-    caught by the test suite. These four are picked because they are
-    the most common Cline tool tags by frequency observed in dumps."""
+    caught by the test suite.
+
+    Ordering reflects the cost of an over-generation past each tag:
+      1. </attempt_completion> stops hallucinated next-turn content
+         (worst case: 3-5x output token inflation)
+      2. </replace_in_file> -- most-frequent edit tool
+      3. </write_to_file> -- bulk file write
+      4. </execute_command> -- shell tool; over-generation past this
+         can produce misleading "next command" prose
+
+    </read_file> is intentionally excluded: over-generation there is
+    benign (just verbose prose) and we are hard-capped at 4 stops.
+    """
     assert CLINE_STOP_SEQUENCES == [
+        "</attempt_completion>",
         "</replace_in_file>",
         "</write_to_file>",
-        "</read_file>",
-        "</attempt_completion>",
+        "</execute_command>",
     ]
+
+
+# ---- Plan / Act mode detection + plan max_tokens cap ---------------------
+
+def _cline_plan_mode_messages() -> list[dict[str, Any]]:
+    """A Cline system prompt that documents the plan_mode_respond tool."""
+    sysprompt = (
+        "You are Cline, a highly skilled software engineer. "
+        "Use <replace_in_file>...</replace_in_file> to modify files. "
+        "## plan_mode_respond\n"
+        "Description: Respond to the user's question or message in PLAN MODE..."
+    )
+    return [
+        {"role": "system", "content": sysprompt},
+        {"role": "user", "content": "<task>Design a billing service</task>"},
+    ]
+
+
+def test_looks_like_cline_plan_mode_true_when_tool_in_system() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode(_cline_plan_mode_messages()) is True
+
+
+def test_looks_like_cline_plan_mode_false_in_act_mode() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode(_cline_messages()) is False
+
+
+def test_looks_like_cline_plan_mode_false_for_non_cline() -> None:
+    from router.overgeneration_control import _looks_like_cline_plan_mode
+    assert _looks_like_cline_plan_mode([
+        {"role": "user", "content": "plan_mode_respond just a word"}
+    ]) is False
+
+
+def test_static_guardrail_caps_plan_mode_at_1024() -> None:
+    """Plan mode requests get LOCAL_MAX_TOKENS_PLAN (1024) instead of
+    the default 6144 ceiling."""
+    from router.overgeneration_control import LOCAL_MAX_TOKENS_PLAN
+    data = {
+        "model": "local-long",
+        "messages": _cline_plan_mode_messages(),
+        "max_tokens": 8192,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == LOCAL_MAX_TOKENS_PLAN
+
+
+def test_static_guardrail_act_mode_keeps_default_cap() -> None:
+    """Act-mode Cline traffic still uses LOCAL_MAX_TOKENS_DEFAULT."""
+    from router.overgeneration_control import LOCAL_MAX_TOKENS_DEFAULT
+    data = {
+        "model": "local-long",
+        "messages": _cline_messages(),
+        "max_tokens": 8192,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == LOCAL_MAX_TOKENS_DEFAULT
+
+
+def test_static_guardrail_plan_mode_does_not_raise_lower_cap() -> None:
+    """If a caller already pinned max_tokens below our plan cap, leave
+    it alone."""
+    data = {
+        "model": "local-long",
+        "messages": _cline_plan_mode_messages(),
+        "max_tokens": 256,
+    }
+    apply_static_guardrail(data)
+    assert data["max_tokens"] == 256
+
+
+# ---- M6: Qwen3 /think directive injection ------------------------------------
+
+def test_inject_qwen3_think_prepends_directive_to_string_content() -> None:
+    from router.overgeneration_control import inject_qwen3_think_directive
+    data = {
+        "model": "local-long",
+        "messages": [
+            {"role": "system", "content": "You are Cline."},
+            {"role": "user", "content": "<task>Fix the failing test.</task>"},
+        ],
+    }
+    inject_qwen3_think_directive(data)
+    assert data["messages"][-1]["content"].startswith("/think ")
+    assert "<task>" in data["messages"][-1]["content"]
+
+
+def test_inject_qwen3_think_idempotent_when_directive_present() -> None:
+    """Already-prefixed messages must not be double-injected."""
+    from router.overgeneration_control import inject_qwen3_think_directive
+    data = {
+        "model": "local-long",
+        "messages": [
+            {"role": "user", "content": "/think Fix the failing test."},
+        ],
+    }
+    inject_qwen3_think_directive(data)
+    assert data["messages"][-1]["content"].count("/think") == 1
+
+
+def test_inject_qwen3_think_respects_no_think_opt_out() -> None:
+    """If the user explicitly disabled thinking with /no_think, we
+    must not flip it back on."""
+    from router.overgeneration_control import inject_qwen3_think_directive
+    data = {
+        "model": "local-long",
+        "messages": [
+            {"role": "user", "content": "/no_think Fix the failing test."},
+        ],
+    }
+    inject_qwen3_think_directive(data)
+    assert data["messages"][-1]["content"].startswith("/no_think")
+    assert "/think " not in data["messages"][-1]["content"]
+
+
+def test_inject_qwen3_think_handles_list_content() -> None:
+    """OpenAI content-parts form: prepend to the first text part."""
+    from router.overgeneration_control import inject_qwen3_think_directive
+    data = {
+        "model": "local-long",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<task>Fix bug.</task>"},
+                    {"type": "image_url", "image_url": "data:..."},
+                ],
+            }
+        ],
+    }
+    inject_qwen3_think_directive(data)
+    first_text = data["messages"][-1]["content"][0]["text"]
+    assert first_text.startswith("/think ")
+
+
+def test_inject_qwen3_think_targets_last_user_message() -> None:
+    """When there are multiple user messages we prepend to the LAST one
+    (the one the model is being asked to respond to)."""
+    from router.overgeneration_control import inject_qwen3_think_directive
+    data = {
+        "model": "local-long",
+        "messages": [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+        ],
+    }
+    inject_qwen3_think_directive(data)
+    assert data["messages"][0]["content"] == "first question"
+    assert data["messages"][-1]["content"].startswith("/think second question")
+
+
+def test_inject_qwen3_think_safe_on_empty_messages() -> None:
+    from router.overgeneration_control import inject_qwen3_think_directive
+    for data in (
+        {"model": "local-long", "messages": []},
+        {"model": "local-long"},  # missing messages key
+        {},  # missing both
+    ):
+        # Must not raise.
+        inject_qwen3_think_directive(data)

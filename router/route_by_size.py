@@ -48,6 +48,7 @@ from router.overgeneration_control import (  # noqa: E402
     _looks_like_cline,
     apply_multi_turn_tighten,
     apply_static_guardrail,
+    inject_qwen3_think_directive,
 )
 
 try:
@@ -104,6 +105,19 @@ def _control_flag(name: str, default: str = "1") -> bool:
 # default too. Disable with OVERGEN_STATIC=0 / OVERGEN_MULTI_TURN=0.
 ENABLE_STATIC_GUARDRAIL = _control_flag("OVERGEN_STATIC", "1")
 ENABLE_MULTI_TURN_TIGHTEN = _control_flag("OVERGEN_MULTI_TURN", "1")
+# Qwen3 /think injection for forced-local complex tasks. Defaults on:
+# the gating logic (only when "[local]" appears in route_reason AND
+# the resolved model is local) is conservative enough that the
+# default-on posture won't surprise users on trivial calls.
+ENABLE_THINK_INJECTION = _control_flag("ROUTER_THINK_INJECTION", "1")
+
+
+def _is_local_model_name(model: str | None) -> bool:
+    """True if the resolved model name belongs to the local tier."""
+    if not isinstance(model, str):
+        return False
+    canonical = model[len("gpt-"):] if model.startswith("gpt-") else model
+    return canonical in ("local-fast", "local-long", "local-agent") or canonical.startswith("local-coder-")
 
 # When OVERGEN_TRACE=1, append a one-line summary to .logs/overgen-trace.log
 # every time a control fires. Used to verify Cursor traffic is being
@@ -211,37 +225,128 @@ def _ensure_db() -> sqlite3.Connection:
     return conn
 
 
-def _estimate_tokens(messages: Iterable[dict[str, Any]] | None) -> int:
-    """Cheap, fast token estimate. We do not need exact tokenization here -
-    the goal is a routing decision, not billing."""
-    if not messages:
-        return 0
+# Tiktoken encoder is loaded lazily so the import cost (~30ms) is paid
+# once per process, not per request. We use cl100k_base because:
+#   - It's the closest publicly available BPE to the actual Qwen
+#     tokenizer (within ~5% on code-heavy English prompts in our bench).
+#   - tiktoken is already installed by scripts/40-litellm.sh.
+# A module-level singleton + lock keeps the lazy init thread-safe under
+# LiteLLM's worker pool.
+_TIKTOKEN_ENCODER = None
+_TIKTOKEN_LOCK = threading.Lock()
+_TIKTOKEN_DISABLED = os.environ.get("ROUTER_DISABLE_TIKTOKEN") == "1"
+
+
+def _get_tiktoken_encoder():
+    """Return a cl100k_base encoder, or None if tiktoken is unavailable
+    or explicitly disabled."""
+    global _TIKTOKEN_ENCODER
+    if _TIKTOKEN_DISABLED:
+        return None
+    if _TIKTOKEN_ENCODER is not None:
+        return _TIKTOKEN_ENCODER
+    with _TIKTOKEN_LOCK:
+        if _TIKTOKEN_ENCODER is not None:
+            return _TIKTOKEN_ENCODER
+        try:
+            import tiktoken
+            _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            # Any failure (offline, missing package, network sandbox)
+            # falls back to the heuristic. Mark disabled so we don't
+            # re-attempt on every call.
+            _TIKTOKEN_ENCODER = None
+            globals()["_TIKTOKEN_DISABLED"] = True
+    return _TIKTOKEN_ENCODER
+
+
+def _heuristic_tokens_from_chars(total_chars: int) -> int:
+    """The original chars/3.6 estimate. Kept as a fast first-pass and
+    as a fallback when tiktoken can't be loaded."""
+    return max(1, int(total_chars / 3.6))
+
+
+# Routing precision matters most near a tier boundary: if the
+# heuristic estimate says "20K tokens" and the boundary is 16K, the
+# routing decision is sensitive to estimator error. Outside this band
+# the heuristic is good enough (and roughly 20-50x faster than running
+# the prompt through tiktoken). Boundary band is symmetric in chars
+# rather than tokens so we don't have to tokenize first.
+#
+# `_TIER_BOUNDARY_BAND_FRACTION = 0.2` means: if the heuristic
+# estimate is within 20% of either ROUTE_FAST_MAX or ROUTE_LONG_MAX
+# we re-tokenize with tiktoken to make a more accurate routing call.
+# Outside the band, we trust the heuristic.
+_TIER_BOUNDARY_BAND_FRACTION = float(
+    os.environ.get("ROUTER_BOUNDARY_BAND", "0.2")
+)
+
+
+def _near_tier_boundary(heuristic_tokens: int) -> bool:
+    """True if the heuristic estimate is close enough to a tier
+    boundary that estimator error could flip the routing decision."""
+    for boundary in (ROUTE_FAST_MAX, ROUTE_LONG_MAX):
+        if boundary <= 0:
+            continue
+        band = boundary * _TIER_BOUNDARY_BAND_FRACTION
+        if abs(heuristic_tokens - boundary) <= band:
+            return True
+    return False
+
+
+def _collect_text(messages: Iterable[dict[str, Any]] | None) -> tuple[int, str]:
+    """Walk message contents once, returning (total_chars, flat_text).
+    Used by both the heuristic and the accurate path so we don't iterate
+    the messages list twice."""
     total_chars = 0
+    parts: list[str] = []
+    if not messages:
+        return 0, ""
     for m in messages:
         c = m.get("content")
         if isinstance(c, str):
             total_chars += len(c)
+            parts.append(c)
         elif isinstance(c, list):
             for part in c:
                 if isinstance(part, dict) and isinstance(part.get("text"), str):
                     total_chars += len(part["text"])
-    # Rough: 1 token ~ 3.6 chars for English+code.
-    return max(1, int(total_chars / 3.6))
+                    parts.append(part["text"])
+    return total_chars, "\n".join(parts)
+
+
+def _estimate_tokens(messages: Iterable[dict[str, Any]] | None) -> int:
+    """Token estimate used for routing decisions.
+
+    Strategy: cheap chars/3.6 heuristic everywhere except in the
+    ±20% band around a tier boundary. Inside the band we run tiktoken
+    (cl100k_base) for a more accurate count, because that's where
+    estimator error actually flips the routing decision.
+
+    Rationale: tiktoken is roughly 20-50x slower than the heuristic
+    (still <5ms for a typical Cline turn), and most prompts are NOT
+    near a boundary. Pay the cost only when it matters.
+    """
+    if not messages:
+        return 0
+    total_chars, flat = _collect_text(messages)
+    heuristic = _heuristic_tokens_from_chars(total_chars)
+    if not _near_tier_boundary(heuristic):
+        return heuristic
+    enc = _get_tiktoken_encoder()
+    if enc is None:
+        return heuristic
+    try:
+        return max(1, len(enc.encode(flat, disallowed_special=())))
+    except Exception:
+        return heuristic
 
 
 def _flat_prompt(messages: Iterable[dict[str, Any]] | None) -> str:
-    if not messages:
-        return ""
-    parts: list[str] = []
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, str):
-            parts.append(c)
-        elif isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and isinstance(p.get("text"), str):
-                    parts.append(p["text"])
-    return "\n".join(parts)
+    """Return all message text joined with newlines. Kept for callers
+    that need the flat text without the char count side-channel."""
+    _, flat = _collect_text(messages)
+    return flat
 
 
 def decide_tier(messages: Iterable[dict[str, Any]] | None) -> tuple[str, str, int]:
@@ -710,6 +815,41 @@ def decide_tier_cline(
         _mark_sticky(fingerprint, why)
         return ("claude-code", f"cline+task({fingerprint}): {why}", task_tokens)
 
+    # Context saturation check. Cline accumulates the full message
+    # history (system prompt + every tool result + every assistant
+    # turn) and resends it on each call, so a long task hits the
+    # local-long 131K ceiling well before the user notices.
+    #
+    # When the FULL request size approaches the local-long ceiling we
+    # escalate to claude-code (200K window) rather than letting the
+    # local stack truncate mid-turn. Sticky-marked so subsequent
+    # turns of the same long-running task stay on Claude instead of
+    # bouncing back and forth between truncated local-long calls and
+    # full-context claude-code calls.
+    #
+    # Threshold rationale:
+    #   - Default 0.85 of ROUTE_LONG_MAX (default 128K), so ~108800.
+    #   - Local-long's actual num_ctx is 131K but model quality drops
+    #     visibly past ~70% (the ContextManager truncation threshold
+    #     on the Cline side, separately).
+    #   - Override with ROUTER_SATURATION_FRACTION env var.
+    full_request_tokens = _estimate_tokens(messages)
+    saturation_fraction = float(
+        os.environ.get("ROUTER_SATURATION_FRACTION", "0.85")
+    )
+    saturation_limit = int(ROUTE_LONG_MAX * saturation_fraction)
+    if full_request_tokens > saturation_limit:
+        sat_reason = (
+            f"saturation: {full_request_tokens} > {saturation_limit} "
+            f"({int(saturation_fraction * 100)}% of {ROUTE_LONG_MAX})"
+        )
+        _mark_sticky(fingerprint, sat_reason)
+        return (
+            "claude-code",
+            f"cline+saturation({fingerprint}): {sat_reason}",
+            task_tokens,
+        )
+
     # Tool-result-driven escalation. Only fires on turns 2+ since
     # turn-1 has no tool result yet. The trigger now requires
     # corroborating signals (see `_looks_like_failure`) so a single
@@ -935,6 +1075,32 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
             pre_stop = data.get("stop")
             pre_n_msgs = len(data.get("messages") or [])
             pre_first_role = ((data.get("messages") or [{}])[0] or {}).get("role")
+
+            # Qwen3 /think directive injection. Fires only when:
+            #   1. Resolved model is local (local-fast or local-long).
+            #   2. The routing reason indicates the user EXPLICITLY
+            #      chose local despite signals that would normally
+            #      escalate to Claude (e.g. `[local]` tag, complex
+            #      content kept local by user override).
+            #
+            # The cheapest reliable signal is the route_reason string
+            # stamped above. It contains "[local]" exactly when the
+            # explicit opt-out tag fired.
+            #
+            # Why we don't unconditionally inject /think on every
+            # local call: extended-reasoning mode costs ~10-30% more
+            # output tokens and roughly doubles per-turn latency. For
+            # trivial tasks that's wasted budget. We only pay the
+            # cost when the user explicitly opted into a hard local
+            # turn.
+            if ENABLE_THINK_INJECTION and _is_local_model_name(data.get("model")):
+                route_reason = (
+                    data.get("metadata", {}).get("route_reason") or ""
+                )
+                if "[local]" in route_reason:
+                    inject_qwen3_think_directive(data)
+                    meta = data.setdefault("metadata", {})
+                    meta["qwen3_think_injected"] = True
 
             if ENABLE_STATIC_GUARDRAIL:
                 apply_static_guardrail(data)

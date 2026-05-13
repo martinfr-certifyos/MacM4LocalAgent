@@ -6,6 +6,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/config/detected.env"
 
+# Auth header array for curl calls that hit authenticated endpoints.
+# /v1/models is open (loopback-only, no auth gate); /v1/chat/completions requires the master key.
+HEADERS=(-H "Authorization: Bearer ${LITELLM_MASTER_KEY:-}")
+
 PASS=0
 FAIL=0
 
@@ -67,7 +71,17 @@ if [[ -n "$REQUESTED_KV" && "$REQUESTED_KV" != f16 && "$EFFECTIVE_KV" != "$REQUE
   fail "KV cache mismatch: requested '$REQUESTED_KV' but daemon does not support it (effective: '$EFFECTIVE_KV'). Run \`make detect && make finalize\` to re-pick a supported type."
 fi
 
-if [[ "${OLLAMA_FLASH_ATTENTION:-$(launchctl getenv OLLAMA_FLASH_ATTENTION 2>/dev/null)}" == "1" ]]; then
+# Check OLLAMA_FLASH_ATTENTION from the running process env first, then
+# fall back to reading the launchd plist (the env var is set per-plist, not
+# globally, so `launchctl getenv` misses it).
+_FLASH_VAL="${OLLAMA_FLASH_ATTENTION:-$(launchctl getenv OLLAMA_FLASH_ATTENTION 2>/dev/null)}"
+if [[ -z "$_FLASH_VAL" ]]; then
+  _OLLAMA_PLIST=~/Library/LaunchAgents/com.local.ollama.plist
+  if [[ -f "$_OLLAMA_PLIST" ]]; then
+    _FLASH_VAL="$(plutil -extract EnvironmentVariables.OLLAMA_FLASH_ATTENTION raw "$_OLLAMA_PLIST" 2>/dev/null || true)"
+  fi
+fi
+if [[ "$_FLASH_VAL" == "1" ]]; then
   ok "OLLAMA_FLASH_ATTENTION=1 (required for q4_0/q8_0/tq3)"
 else
   case "$EFFECTIVE_KV" in
@@ -104,11 +118,13 @@ smoke() {
 echo
 echo "== Smoke matrix =="
 smoke "local-fast"  "Write a one-line Python function that returns x+1." "local-fast 1k tokens"
-smoke "hybrid-auto" "Refactor this small snippet: def f(x): return x*2" "hybrid-auto small -> local-fast"
+# Use a prompt that is clearly below ROUTE_FAST_MAX and contains no complexity-classifier keywords.
+smoke "hybrid-auto" "What is the capital of France?" "hybrid-auto tiny -> local-fast"
 
-# Build a long-ish prompt to probe local-long routing without hammering Claude.
-LONG="$(python3 -c "print('// noise\n' * 5000)")"
-smoke "hybrid-auto" "$LONG"$'\n\nSummarize the above noisy file in one sentence.' "hybrid-auto 18k tokens -> local-long"
+# 7000 lines × ~2.5 tok/line ≈ 17500 tokens > ROUTE_FAST_MAX(16000) → routes to local-long.
+# (5000 lines only reached ~12500 tokens, below the threshold.)
+LONG="$(python3 -c "print('// noise\n' * 7000)")"
+smoke "hybrid-auto" "$LONG"$'\n\nSummarize the above noisy file in one sentence.' "hybrid-auto 17k tokens -> local-long"
 
 # claude-code only if ANTHROPIC_API_KEY is set.
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then

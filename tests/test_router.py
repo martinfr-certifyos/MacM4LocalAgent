@@ -90,6 +90,100 @@ def test_flat_prompt_concats() -> None:
     assert "hi"  in _flat_prompt(msgs)
 
 
+# ---- M1: tiktoken-accurate path near tier boundaries -------------------------
+
+def test_estimate_tokens_far_from_boundary_uses_heuristic(monkeypatch) -> None:
+    """Tiny prompts are nowhere near a tier boundary; estimator stays
+    on the cheap chars/3.6 path. We pin the result to the heuristic
+    value to detect accidental tiktoken regressions for cheap calls."""
+    from router import route_by_size
+
+    # Sentinel encoder that raises if called -- guarantees we did NOT
+    # invoke tiktoken on a non-boundary input.
+    class _Boom:
+        def encode(self, *_a, **_k):
+            raise AssertionError("tiktoken called on non-boundary input")
+
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_ENCODER", _Boom())
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_DISABLED", False)
+    msgs = [{"role": "user", "content": "x" * 360}]  # heuristic = 100
+    assert _estimate_tokens(msgs) == 100
+
+
+def test_estimate_tokens_near_boundary_uses_tiktoken(monkeypatch) -> None:
+    """Inside the ±20% band around ROUTE_FAST_MAX we re-tokenize. A
+    stub encoder returns a known token count; we verify it was used
+    instead of the heuristic."""
+    from router import route_by_size
+
+    class _StubEncoder:
+        called = 0
+
+        def encode(self, text: str, **_k):
+            type(self).called += 1
+            # Return a deterministic count so the test assertion is
+            # not coupled to cl100k_base behaviour.
+            return [0] * 12345
+
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_ENCODER", _StubEncoder())
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_DISABLED", False)
+
+    # Heuristic = 16000 (right on the boundary -> always inside band).
+    msgs = [{"role": "user", "content": "x" * int(16000 * 3.6)}]
+    assert _estimate_tokens(msgs) == 12345
+    assert _StubEncoder.called == 1
+
+
+def test_estimate_tokens_falls_back_when_tiktoken_disabled(monkeypatch) -> None:
+    """If tiktoken is disabled (e.g. failed import, env opt-out), the
+    estimator silently returns the heuristic value even near a
+    boundary."""
+    from router import route_by_size
+
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_ENCODER", None)
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_DISABLED", True)
+
+    msgs = [{"role": "user", "content": "x" * int(16000 * 3.6)}]
+    # Heuristic value should come through unchanged.
+    assert _estimate_tokens(msgs) == 16000
+
+
+def test_estimate_tokens_falls_back_on_tiktoken_exception(monkeypatch) -> None:
+    """If tiktoken raises (e.g. encoding error on weird unicode), we
+    return the heuristic instead of crashing the router callback."""
+    from router import route_by_size
+
+    class _Raiser:
+        def encode(self, *_a, **_k):
+            raise RuntimeError("simulated tiktoken failure")
+
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_ENCODER", _Raiser())
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_DISABLED", False)
+
+    msgs = [{"role": "user", "content": "x" * int(16000 * 3.6)}]
+    assert _estimate_tokens(msgs) == 16000  # heuristic fallback
+
+
+def test_near_tier_boundary_band() -> None:
+    """The ±20% band is symmetric in tokens around each tier max."""
+    from router.route_by_size import (
+        _near_tier_boundary,
+        ROUTE_FAST_MAX,
+        ROUTE_LONG_MAX,
+    )
+
+    # Right on the boundary -> inside.
+    assert _near_tier_boundary(ROUTE_FAST_MAX) is True
+    assert _near_tier_boundary(ROUTE_LONG_MAX) is True
+
+    # Just outside the fast-band on the low side.
+    assert _near_tier_boundary(int(ROUTE_FAST_MAX * 0.75)) is False
+    # Just inside the long-band on the high side.
+    assert _near_tier_boundary(int(ROUTE_LONG_MAX * 1.15)) is True
+    # Way past the long boundary.
+    assert _near_tier_boundary(int(ROUTE_LONG_MAX * 1.5)) is False
+
+
 # ---- decide_tier --------------------------------------------------------------
 
 def test_decide_tier_routes_small_to_fast() -> None:
@@ -100,7 +194,12 @@ def test_decide_tier_routes_small_to_fast() -> None:
 
 
 def test_decide_tier_routes_medium_to_long() -> None:
-    chars = (ROUTE_FAST_MAX + 1000) * 4   # comfortably above the fast limit
+    # Heuristic must land clearly above the fast-tier band so the
+    # tiktoken-accurate path doesn't kick in. The ±20% band ends at
+    # ROUTE_FAST_MAX * 1.2, so we aim for ~1.3x to be safely outside
+    # AND still well under ROUTE_LONG_MAX.
+    target_tokens = int(ROUTE_FAST_MAX * 1.3)
+    chars = target_tokens * 4  # 4 chars/token heuristic upper bound
     msgs = [{"role": "user", "content": "x" * chars}]
     model, reason, tokens = decide_tier(msgs)
     assert model == "local-long"
@@ -108,7 +207,11 @@ def test_decide_tier_routes_medium_to_long() -> None:
 
 
 def test_decide_tier_routes_huge_to_claude() -> None:
-    chars = (ROUTE_LONG_MAX + 5000) * 4
+    # Push well beyond the long-tier band (>1.2x ROUTE_LONG_MAX) so the
+    # heuristic alone resolves the routing and tiktoken's accurate path
+    # never fires.
+    target_tokens = int(ROUTE_LONG_MAX * 1.3)
+    chars = target_tokens * 4
     msgs = [{"role": "user", "content": "x" * chars}]
     model, reason, tokens = decide_tier(msgs)
     assert model == "claude-code"
@@ -406,6 +509,116 @@ def test_decide_tier_cline_default_routes_to_local_long() -> None:
     tier, reason, _ = decide_tier_cline(msgs)
     assert tier == "local-long"
     assert "default" in reason
+
+
+# ---- M5: context saturation routing signal ------------------------------------
+
+@pytest.fixture
+def heuristic_only_estimator(monkeypatch):
+    """Pin _estimate_tokens to the cheap chars/3.6 heuristic so the M5
+    saturation tests have a single, deterministic token count regardless
+    of whether tiktoken (M1) decides to re-tokenize at a tier boundary.
+
+    Why: M5 covers the *routing* decision once a request approaches the
+    local-long ceiling -- not how tokens are counted. The padding helper
+    sizes content in heuristic units (chars/3.6); tiktoken on repeated
+    characters compresses heavily, collapsing the padding to far fewer
+    tokens and silently dropping below the saturation threshold. M1
+    already has dedicated coverage for the boundary-band tokenizer path
+    (see test_estimate_tokens_near_boundary_uses_tiktoken)."""
+    from router import route_by_size
+
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_DISABLED", True)
+    monkeypatch.setattr(route_by_size, "_TIKTOKEN_ENCODER", None)
+    yield
+
+
+def _padded_cline_msgs(task: str, target_fraction: float) -> list[dict[str, Any]]:
+    """Build Cline messages whose _estimate_tokens result is approximately
+    target_fraction * ROUTE_LONG_MAX. Sized in the heuristic's units
+    (chars/3.6); pair with the `heuristic_only_estimator` fixture so the
+    router uses the same heuristic when scoring the padded payload.
+    """
+    from router.route_by_size import ROUTE_LONG_MAX
+
+    target_tokens = int(ROUTE_LONG_MAX * target_fraction)
+    pad_chars = int(target_tokens * 3.6)
+    return _cline_msgs(
+        task,
+        {"role": "assistant", "content": "y" * pad_chars},
+    )
+
+
+def test_decide_tier_cline_saturated_context_escalates_to_claude(
+    heuristic_only_estimator,
+) -> None:
+    """When the FULL request size approaches the local-long ceiling we
+    escalate to claude-code instead of letting the local stack truncate.
+
+    Pad to ~88% of ROUTE_LONG_MAX: comfortably above the 85% default
+    trigger and below the 99% override used in the env-override test."""
+    msgs = _padded_cline_msgs(
+        "Add a single-line comment to main.py", target_fraction=0.88
+    )
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "claude-code"
+    assert "saturation" in reason
+
+
+def test_decide_tier_cline_below_saturation_threshold_stays_local(
+    heuristic_only_estimator,
+) -> None:
+    """A long-but-not-saturated request stays on local-long."""
+    # 50% of the local-long ceiling: comfortably below the 85% trigger.
+    msgs = _padded_cline_msgs(
+        "Add a single-line comment to main.py", target_fraction=0.5
+    )
+    tier, _reason, _ = decide_tier_cline(msgs)
+    assert tier == "local-long"
+
+
+def test_decide_tier_cline_saturation_marks_sticky(
+    heuristic_only_estimator,
+) -> None:
+    """A saturation-triggered escalation must mark the task fingerprint
+    sticky so subsequent turns don't bounce back to local-long once
+    truncation reduces the request size."""
+    from router.route_by_size import _check_sticky, _task_fingerprint
+
+    task = "Add a single-line comment to main.py"
+    msgs = _padded_cline_msgs(task, target_fraction=0.88)
+    decide_tier_cline(msgs)
+    sticky = _check_sticky(_task_fingerprint(task))
+    assert sticky is not None
+    assert "saturation" in sticky
+
+
+def test_decide_tier_cline_saturation_respects_local_override(
+    heuristic_only_estimator,
+) -> None:
+    """The [local] opt-out tag must beat saturation -- if the user
+    deliberately picked local on a near-full context, they accept the
+    truncation tradeoff."""
+    msgs = _padded_cline_msgs(
+        "[local] Add a single-line comment to main.py", target_fraction=0.88
+    )
+    tier, reason, _ = decide_tier_cline(msgs)
+    assert tier == "local-long"
+    assert "[local]" in reason
+
+
+def test_decide_tier_cline_saturation_threshold_env_override(
+    monkeypatch, heuristic_only_estimator,
+) -> None:
+    """ROUTER_SATURATION_FRACTION lets operators tune the trigger
+    point. Setting it to 0.99 makes a request that normally trips the
+    default 0.85 threshold stay local."""
+    monkeypatch.setenv("ROUTER_SATURATION_FRACTION", "0.99")
+    msgs = _padded_cline_msgs(
+        "Add a single-line comment to main.py", target_fraction=0.88
+    )
+    tier, _, _ = decide_tier_cline(msgs)
+    assert tier == "local-long"
 
 
 def test_decide_tier_cline_complexity_keyword_escalates() -> None:

@@ -184,6 +184,13 @@ litellm_settings:
   success_callback: ["router.route_by_size.proxy_handler_instance"]
   database_url: "sqlite:///./cost/cost.db"
   set_verbose: false
+  # Auto-cancel requests whose upstream connection is still open after
+  # 360 s. Protects against orphaned Ollama generations when Cline drops
+  # its network connection mid-stream (e.g. Cursor crash, laptop sleep).
+  # The MacM4Handler client-side abort fires at 300 s; this proxy-side
+  # timeout gives a 60 s grace window before LiteLLM closes the Ollama
+  # socket itself.
+  request_timeout: 360
 
 # No general_settings.master_key by design.
 #
