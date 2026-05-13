@@ -47,12 +47,14 @@ act() { log "ACT  $*"; }
 log "=== watchdog run ==="
 
 OLLAMA_MODELS=$(curl -sf --max-time 5 "${OLLAMA_URL}/api/ps" 2>/dev/null || echo '{"models":[]}')
+export NOW_EPOCH
 NOW_EPOCH=$(date +%s)
+export OLLAMA_MODELS
 
-echo "$OLLAMA_MODELS" | python3 - <<'PYEOF'
-import sys, json, os, subprocess, datetime
+python3 <<'PYEOF'
+import json, os, datetime, urllib.request
 
-data = json.loads(sys.stdin.read())
+data = json.loads(os.environ.get("OLLAMA_MODELS", '{"models":[]}'))
 models = data.get("models", [])
 now = int(os.environ.get("NOW_EPOCH", "0"))
 stale_sec = int(os.environ.get("STALE_THRESHOLD_SEC", "420"))
@@ -61,11 +63,12 @@ log_prefix = os.environ.get("WATCHDOG_LOG_PREFIX", "")
 
 if not models:
     print(f"{log_prefix}[ollama] no models loaded — nothing to flush")
-    sys.exit(0)
+    raise SystemExit(0)
 
 for m in models:
     name = m.get("name", "?")
     exp_str = m.get("expires_at", "")
+    exp_epoch = None
     try:
         # Parse ISO8601 with timezone offset (Python 3.11+ handles %z easily)
         exp_dt = datetime.datetime.fromisoformat(exp_str)
@@ -77,7 +80,6 @@ for m in models:
     if age_sec > stale_sec:
         print(f"{log_prefix}[ollama] STALE model {name} expired {age_sec}s ago — flushing VRAM")
         # Send keep_alive:0 to unload immediately
-        import urllib.request
         payload = json.dumps({"model": name, "keep_alive": 0}).encode()
         req = urllib.request.Request(
             f"{ollama_url}/api/generate",
@@ -91,8 +93,11 @@ for m in models:
         except Exception as e:
             print(f"{log_prefix}[ollama] flush failed for {name}: {e}")
     else:
-        secs_until = exp_epoch - now if age_sec < 0 else -age_sec
-        print(f"{log_prefix}[ollama] {name} — expires in {secs_until}s (healthy)")
+        if exp_epoch is not None:
+            secs_until = exp_epoch - now if age_sec < 0 else -age_sec
+            print(f"{log_prefix}[ollama] {name} — expires in {secs_until}s (healthy)")
+        else:
+            print(f"{log_prefix}[ollama] {name} — unparseable expires_at '{exp_str}', skipping")
 PYEOF
 
 # ── 2. LiteLLM stale-request check ───────────────────────────────────────────
