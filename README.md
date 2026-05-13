@@ -339,7 +339,7 @@ make report      # CLI savings summary (today / 7d / 30d / all-time)
 make dashboard   # starts the dashboard service (if not already running)
 ```
 
-Dashboard URL: **<http://127.0.0.1:4001>**
+Dashboard URL: **[http://127.0.0.1:4001](http://127.0.0.1:4001)**
 
 ### Inline routing overrides
 
