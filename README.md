@@ -30,12 +30,20 @@ flowchart LR
     LiteLLM -->|">128k"| Claude["Anthropic API<br/>claude-opus-4-7<br/>(API key)"]
     ClaudeProxy -->|">128k<br/>passthrough"| Claude2["Anthropic API<br/>claude-opus-4-7<br/>(Team OAuth)"]
     
+    LiteLLM -.->|"offline / OFFLINE=1<br/>downgrade"| LocalModels
+    
     LiteLLM --> DB[("cost.db")]
     ClaudeProxy --> DB
     DB --> Dash["Dashboard :4001"]
 ```
 
-> **Why Cline + local, not Cursor's native Agent?** Cursor's native agent routes requests
+> **Airplane / no-network?** The router auto-detects when
+> `api.anthropic.com:443` is unreachable and silently rewrites every
+> Claude selection to `local-long`. Force it permanently with
+> `make offline` (no proxy restart needed). Details:
+> [docs/offline-mode.md](docs/offline-mode.md).
+
+> **Why Cline + Claude Code, not Cursor's native Agent?** Cursor's native agent routes requests
 > through `api2.cursor.sh` (blocks loopback + RFC 1918 + CGNAT) and doesn't
 > pass tool-call deltas through. Cline and Claude Code run in the local extension host and
 > call `127.0.0.1:4000` / `:4002` directly. Details:
