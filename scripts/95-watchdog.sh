@@ -23,7 +23,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WATCHDOG_LOG="${REPO_ROOT}/logs/watchdog.log"
+WATCHDOG_LOG="${REPO_ROOT}/.logs/watchdog.log"
 OLLAMA_URL="http://127.0.0.1:11434"
 LITELLM_URL="http://127.0.0.1:4000"
 LITELLM_PLIST="com.local.litellm"

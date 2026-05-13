@@ -497,7 +497,10 @@ def _resolve_ollama_tag() -> str:
 def _macm4_models_payload() -> dict[str, Any]:
     """Build the response body. Centralised so tests can call it
     without spinning up the ASGI app."""
-    loaded_ollama = _probe_ollama_loaded_models()
+    try:
+        loaded_ollama = _probe_ollama_loaded_models()
+    except Exception:
+        loaded_ollama = set()
     expected_ollama = _resolve_ollama_tag()
 
     models: list[dict[str, Any]] = []

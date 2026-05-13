@@ -18,8 +18,8 @@
     <key>PATH</key>   <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
 
-  <key>StandardOutPath</key>   <string>@@REPO_ROOT@@/logs/watchdog.log</string>
-  <key>StandardErrorPath</key> <string>@@REPO_ROOT@@/logs/watchdog.log</string>
+  <key>StandardOutPath</key>   <string>@@REPO_ROOT@@/.logs/watchdog.log</string>
+  <key>StandardErrorPath</key> <string>@@REPO_ROOT@@/.logs/watchdog.log</string>
   <key>RunAtLoad</key>         <false/>
 </dict>
 </plist>

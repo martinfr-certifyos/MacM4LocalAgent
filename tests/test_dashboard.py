@@ -446,8 +446,6 @@ def test_macm4_models_endpoint_does_not_crash_on_ollama_timeout(client: TestClie
     def _boom() -> set[str]:
         raise RuntimeError("simulated Ollama outage")
     monkeypatch.setattr(dash_app, "_probe_ollama_loaded_models", _boom)
-    # The endpoint catches its own probe errors.
-    monkeypatch.setattr(dash_app, "_probe_ollama_loaded_models", lambda: set())
     r = client.get("/api/macm4-models")
     assert r.status_code == 200
     by_id = {m["id"]: m for m in r.json()["data"]}

@@ -47,6 +47,9 @@ for src in "$REPO_ROOT"/launchd/*.plist; do
       -e "s|@@OLLAMA_KEEP_ALIVE@@|$OLLAMA_KEEP_ALIVE|g" \
       -e "s|@@OLLAMA_PORT@@|$OLLAMA_PORT|g" \
       -e "s|@@OLLAMA_TAG@@|$OLLAMA_TAG|g" \
+      -e "s|@@HOME@@|$HOME|g" \
+      -e "s|@@USER@@|$USER|g" \
+      -e "s|@@TMPDIR@@|${TMPDIR:-/tmp}|g" \
       "$src" > "$out"
   log "rendered $(basename "$out") (KV=$KV_CACHE_TYPE, parallel=$OLLAMA_NUM_PARALLEL, keep_alive=$OLLAMA_KEEP_ALIVE)"
 done
