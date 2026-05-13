@@ -6,7 +6,7 @@ REPO_ROOT := $(shell pwd)
 SCRIPTS := $(REPO_ROOT)/scripts
 LAUNCHD_DIR := $(REPO_ROOT)/launchd
 LAUNCH_AGENTS := $(HOME)/Library/LaunchAgents
-PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard com.local.ollama-warm com.local.watchdog
+PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard com.local.ollama-warm com.local.watchdog com.local.claude-proxy
 
 .PHONY: help detect install start stop restart status dashboard verify watchdog report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline warm offline online offline-status
 
@@ -85,7 +85,7 @@ restart: stop start ## Restart all services
 status: ## Show running ports
 	@echo "Port  Service        Status"
 	@echo "----  -------------  ------"
-	@for entry in "11434 ollama" "8081 mlx" "4000 litellm" "4001 dashboard"; do \
+	@for entry in "11434 ollama" "8081 mlx" "4000 litellm" "4001 dashboard" "4002 claude-proxy"; do \
 	  port="$${entry%% *}"; name="$${entry##* }"; \
 	  if lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null 2>&1; then \
 	    echo "$$port  $$name        UP"; \
