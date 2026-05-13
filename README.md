@@ -227,14 +227,15 @@ make start
 Copies the four rendered plists to `~/Library/LaunchAgents/` and
 `launchctl load`s each one:
 
-| Plist                       | What it runs                            | Port  |
-| --------------------------- | --------------------------------------- | ----- |
-| `com.local.ollama.plist`    | `ollama serve`                          | 11434 |
-| `com.local.mlx.plist`       | `mlx_lm.server` (from `.venvs/mlx`)     | 8081  |
-| `com.local.litellm.plist`   | `python scripts/run_litellm.py …`       | 4000  |
-| `com.local.dashboard.plist` | `python -m dashboard.server` (FastAPI)  | 4001  |
+| Plist                             | What it runs                            | Port  | Client      |
+| ---------------------------------- | --------------------------------------- | ----- | ----------- |
+| `com.local.ollama.plist`           | `ollama serve`                          | 11434 | shared      |
+| `com.local.mlx.plist`             | `mlx_lm.server` (from `.venvs/mlx`)     | 8081  | shared      |
+| `com.local.litellm.plist`         | `python scripts/run_litellm.py …`       | 4000  | Cline       |
+| `com.local.dashboard.plist`       | `python -m dashboard.server` (FastAPI)  | 4001  | browser     |
+| `com.local.claude-proxy.plist`    | `python claude_proxy/server.py …`       | 4002  | Claude Code |
 
-All four bind to `127.0.0.1` only.
+All five bind to `127.0.0.1` only. Cline uses `:4000`; Claude Code uses `:4002`. The ports are isolated by design — see [Two clients, one deployment](#two-clients-one-deployment) below.
 
 ### 6. Wait for downloads, then verify
 
@@ -257,6 +258,10 @@ Port  Service        Status
 8081  mlx            UP
 4000  litellm        UP
 4001  dashboard      UP
+4002  claude-proxy   UP
+== claude-proxy health ==
+  PASS  claude-proxy /health → status=ok large_ctx_mode=passthrough
+  PASS  claude-proxy large-ctx uses Team OAuth (no ANTHROPIC_API_KEY needed)
 == LiteLLM model registry ==
   local-fast OK
   local-long OK
@@ -265,8 +270,10 @@ Port  Service        Status
   …
 ```
 
-If `claude-code` reports an error, check `launchctl getenv ANTHROPIC_API_KEY`
-returns your key (step 2.3 above).
+If `claude-code` (LiteLLM/Cline tier) reports an error, check
+`launchctl getenv ANTHROPIC_API_KEY` returns your key (step 2.3 above).
+If `claude-proxy` shows DOWN, run `make restart` — it starts with the
+other services automatically after `make install`.
 
 ### 7. Install the Cline extension
 
@@ -401,6 +408,102 @@ edit-loop semantics, troubleshooting):
 
 ---
 
+## Wire Claude Code to the proxy
+
+Claude Code is Anthropic's own coding agent, available as a VS Code / Cursor
+extension. It natively sends Anthropic-format requests, so it connects to the
+dedicated `claude_proxy` on `:4002` rather than the LiteLLM endpoint on `:4000`.
+
+### Step 1 — Install Claude Code
+
+In Cursor or VS Code, install the **Claude Code** extension from the Marketplace
+(publisher: `anthropics`), or via the CLI:
+
+```bash
+cursor --install-extension anthropics.claude-code   # Cursor
+code   --install-extension anthropics.claude-code   # VS Code
+```
+
+Sign in with your claude.ai account when prompted (no extra setup needed beyond
+normal Claude Code onboarding).
+
+### Step 2 — Point Claude Code at the local proxy
+
+Add these two lines to your shell profile (`~/.zshrc` or `~/.bash_profile`):
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4002"
+launchctl setenv ANTHROPIC_BASE_URL "http://127.0.0.1:4002"
+```
+
+Then:
+
+```bash
+source ~/.zshrc         # reload for the current shell
+# Fully quit and relaunch your IDE
+```
+
+### Step 3 — Verify
+
+Ask Claude Code a simple question (e.g. "What files are in this directory?").
+Then check the proxy log:
+
+```bash
+tail -f ~/MacM4LocalAgent/.logs/claude-proxy.out.log
+# Small prompt  → route=local  (free, Ollama)
+# Large prompt  → route=upstream mode=passthrough  (Team subscription)
+```
+
+Or run `make verify` — it will show:
+
+```
+PASS  claude-proxy /health → status=ok large_ctx_mode=passthrough
+PASS  claude-proxy large-ctx uses Team OAuth (no ANTHROPIC_API_KEY needed)
+```
+
+### Large-context billing mode
+
+By default, requests that exceed 128 k tokens are proxied to `api.anthropic.com`
+using Claude Code's own **Team subscription OAuth token** — no `ANTHROPIC_API_KEY`
+is read or injected. To switch to pay-per-token API billing instead, edit
+`config/detected.env` and set:
+
+```bash
+CLAUDE_PROXY_LARGE_CTX_MODE=apikey   # requires ANTHROPIC_API_KEY to be set
+```
+
+Then `make restart`. See [docs/CLAUDE-CODE-INTEGRATION.md](docs/CLAUDE-CODE-INTEGRATION.md)
+for full details and the ToS compliance rationale.
+
+---
+
+## Two clients, one deployment
+
+A single MacM4 instance handles **both Cline and Claude Code simultaneously**:
+
+| Client      | Port  | Auth for large-context      | Format    |
+| ----------- | ----- | --------------------------- | --------- |
+| Cline       | :4000 | `ANTHROPIC_API_KEY`         | OpenAI    |
+| Claude Code | :4002 | Team OAuth (passthrough)    | Anthropic |
+
+The two ports are **architecturally isolated** — Cline never reaches the
+OAuth passthrough path, and Claude Code never passes through the API-key
+LiteLLM path. Both clients share the same free local model pool
+(Ollama / MLX on `:11434` / `:8081`) for small-context requests.
+
+```
+Cline  ──► :4000 (LiteLLM)  ──► local or ANTHROPIC_API_KEY
+Claude Code ──► :4002 (claude_proxy) ──► local or Team OAuth
+                                   ↓ (shared)
+                            Ollama :11434 / MLX :8081
+```
+
+No configuration is needed beyond the two env vars above. `make start`
+loads all five launchd services together.
+
+
+---
+
 ## Models in play today
 
 What `make install` actually downloads + what the proxy exposes, against
@@ -447,15 +550,25 @@ want them: `ollama pull llama3.1:8b-instruct-q8_0`,
 | Run the test suite                      | `make test`                                       |
 | Reset everything (keep models)          | `make clean && make install`                      |
 | Reset everything (also drop models)     | `make nuke && make install`                       |
+| Wire Claude Code to the local proxy     | Set `ANTHROPIC_BASE_URL=http://127.0.0.1:4002`    |
+| Check claude-proxy health               | `curl -s http://127.0.0.1:4002/health`            |
+| View claude-proxy routing log           | `tail -f .logs/claude-proxy.out.log`              |
+| Switch large-ctx mode (passthrough↔apikey) | Edit `CLAUDE_PROXY_LARGE_CTX_MODE` in `config/detected.env`, then `make restart` |
 
 ---
 
 ## Security
 
-- **Loopback-only.** All four services bind to `127.0.0.1`. Verified via
+- **Loopback-only.** All five services bind to `127.0.0.1`. Verified via
   `lsof -nP -iTCP:4000 -sTCP:LISTEN` (returns `TCP 127.0.0.1:4000 (LISTEN)`)
-  and the launchd plist passes `--host 127.0.0.1` explicitly. Nothing
+  and each launchd plist passes `--host 127.0.0.1` explicitly. Nothing
   off-Mac can reach the proxy.
+- **Port isolation.** Cline traffic (`:4000`) never has access to the
+  Team OAuth passthrough path. Claude Code traffic (`:4002`) is handled by
+  `claude_proxy` which, in `passthrough` mode, forwards the original OAuth
+  bearer token to Anthropic unchanged — `ANTHROPIC_API_KEY` is never read on
+  this path. In `apikey` mode the API key IS used; switching modes requires
+  an explicit edit to `config/detected.env` and `make restart`.
 - **No `master_key` on the LiteLLM proxy.** The loopback bind IS the
   security boundary. A bearer-token gate on top of loopback added no real
   protection and was operational tax. To re-enable for off-host exposure
