@@ -266,14 +266,20 @@ def tasks_one_live(request: Request, task_id: str) -> Any:
     turns_rows = conn.execute(
         "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, "
         "shadow_cost, latency_ms, route_reason "
-        "FROM requests WHERE task_id = ? ORDER BY id ASC",
+        "FROM requests WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     ).fetchall()
     conn.close()
 
-    turns = [dict(r) for r in turns_rows]
-    for r in turns:
-        r["ts_human"] = _fmt_ts(r["ts"])
+    # Rows are newest-first from the DB; compute the logical turn number
+    # (1-based, ascending by time) before reversing so #1 is the oldest.
+    total = len(turns_rows)
+    turns = []
+    for i, r in enumerate(turns_rows):
+        d = dict(r)
+        d["turn_num"] = total - i   # newest row gets the highest number
+        d["ts_human"] = _fmt_ts(d["ts"])
+        turns.append(d)
 
     # Find an active request belonging to this task.
     active_for_task = [a for a in _load_active() if a.get("task_id") == task_id]
