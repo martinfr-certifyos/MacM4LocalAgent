@@ -159,9 +159,9 @@ def test_hook_tolerates_empty_and_choiceless_chunks() -> None:
     """Role-only deltas, empty content, and choiceless chunks pass through
     untouched (defensive guards), and a trailing partial open tag is
     flushed as content."""
+    pytest.importorskip("litellm")
     from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 
-    pytest.importorskip("litellm")
     router = SizeBasedRouter.__new__(SizeBasedRouter)
     role_chunk = ModelResponseStream(
         choices=[StreamingChoices(index=0, delta=Delta(role="assistant"))]
