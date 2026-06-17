@@ -198,11 +198,16 @@ def test_tasks_list_excludes_non_cline_rows(client: TestClient) -> None:
 
 def test_tasks_one_renders_per_turn_breakdown(client: TestClient) -> None:
     """Drill-down: every turn for a task in chronological order with
-    full route_reason, tier, and cost columns."""
+    full route_reason, tier, and cost columns. The static page renders
+    the header; the per-turn breakdown lives in the HTMX-polled
+    /tasks/{id}/_live fragment."""
     _seed_cline_task(int(time.time()))
-    r = client.get("/tasks/abc123def4567890")
+    page = client.get("/tasks/abc123def4567890")
+    assert page.status_code == 200
+    assert "Add a one-line comment to README.md" in page.text
+    # The per-turn breakdown + counts live in the live fragment.
+    r = client.get("/tasks/abc123def4567890/_live")
     assert r.status_code == 200
-    assert "Add a one-line comment to README.md" in r.text
     # All three turns are rendered (turn count badge in the summary card).
     assert "<b>3</b>" in r.text or ">3<" in r.text
     # Each turn's route_reason should be present, including the sticky one.
@@ -218,9 +223,11 @@ def test_tasks_one_404_for_unknown_id(client: TestClient) -> None:
 
 def test_tasks_one_aggregates_cost_correctly(client: TestClient) -> None:
     """Summary card totals must equal the sum of the turn rows. Pinning
-    this prevents future refactors from quietly breaking cost rollup."""
+    this prevents future refactors from quietly breaking cost rollup.
+    The summary card is rendered by the polled /tasks/{id}/_live
+    fragment."""
     _seed_cline_task(int(time.time()))
-    r = client.get("/tasks/abc123def4567890")
+    r = client.get("/tasks/abc123def4567890/_live")
     assert r.status_code == 200
     # The seeded data: 13000 + 14000 + 15000 = 42000 input, 120 + 200 + 400 = 720 out
     # Actual: 0 + 0 + 0.051 = $0.0510
