@@ -8,13 +8,20 @@ LAUNCHD_DIR := $(REPO_ROOT)/launchd
 LAUNCH_AGENTS := $(HOME)/Library/LaunchAgents
 PLISTS := com.local.ollama com.local.mlx com.local.litellm com.local.dashboard com.local.ollama-warm com.local.watchdog com.local.claude-proxy
 
-.PHONY: help detect install start stop restart status dashboard verify watchdog report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline warm offline online offline-status worktree worktree-rm worktree-sync worktree-list
+.PHONY: help detect install reconfigure start stop restart status dashboard verify watchdog report compare clean nuke test test-py test-sh lint finalize downloads downloads-watch wait-and-finalize resume-ollama bench bench-local bench-claude bench-cursor bench-report bench-pull-spend turboquant-status turboquant-upgrade turboquant-watch turboquant-experimental-build turboquant-experimental-serve turboquant-experimental-stop turboquant-experimental-status turboquant-experimental-ab turboquant-experimental-nuke perf perf-short perf-stress perf-prefix perf-prefix-cold check-pricing cline warm offline online offline-status worktree worktree-rm worktree-sync worktree-list
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 detect: ## Scan hardware and write config/detected.env
 	@bash $(SCRIPTS)/00-detect.sh
+
+reconfigure: ## Re-render LiteLLM config + restart LiteLLM (no model downloads)
+	@bash $(SCRIPTS)/40-litellm.sh
+	@launchctl unload $(LAUNCH_AGENTS)/com.local.litellm.plist 2>/dev/null || true
+	@cp $(LAUNCHD_DIR)/com.local.litellm.rendered.plist $(LAUNCH_AGENTS)/com.local.litellm.plist
+	@launchctl load -w $(LAUNCH_AGENTS)/com.local.litellm.plist
+	@echo "LiteLLM restarted with updated config."
 
 install: detect ## Install all components (idempotent)
 	@bash $(SCRIPTS)/10-brew.sh
