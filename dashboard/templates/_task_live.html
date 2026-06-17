@@ -1,0 +1,82 @@
+{# HTMX fragment — replaces #live-region on every poll.
+   Poll rate: 3 s while in_flight, 10 s otherwise. #}
+
+{% set poll_secs = 3 if in_flight else 10 %}
+
+<div id="live-region"
+     hx-get="/tasks/{{ task_id }}/_live"
+     hx-trigger="every {{ poll_secs }}s"
+     hx-swap="outerHTML"
+     hx-target="#live-region">
+
+  {# Summary strip — updates as new turns land #}
+  <div class="card" style="margin-bottom:1rem">
+    <div class="kv">
+      <span>Turns</span><b>{{ summary.turns }}{% if in_flight %} <span class="active-dot">●</span>{% endif %}</b>
+      <span>Wall time</span><b>{{ "%.1f"|format(summary.wall_seconds) }}s</b>
+      <span>Tokens in / out</span>
+      <b>{{ "{:,}".format(summary.input_tok) }} / {{ "{:,}".format(summary.output_tok) }}</b>
+      <span>Actual spend</span><b>${{ "%.4f"|format(summary.actual_cost) }}</b>
+      <span>Shadow spend</span><b>${{ "%.4f"|format(summary.shadow_cost) }}</b>
+    </div>
+    <div class="tiers">
+      {% for tier, n in summary.tier_counts.items() %}
+        <span class="tier tier-{{ tier }}">{{ tier }}: {{ n }}</span>
+      {% endfor %}
+    </div>
+  </div>
+
+  <h2>Turns</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>time</th>
+        <th>tier</th>
+        <th>model</th>
+        <th>in tok</th>
+        <th>out tok</th>
+        <th>$ actual</th>
+        <th>ms</th>
+        <th>reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in turns %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td class="muted small">{{ r.ts_human }}</td>
+        <td><span class="tier tier-{{ r.tier }}">{{ r.tier }}</span></td>
+        <td><code>{{ r.model }}</code></td>
+        <td>{{ "{:,}".format(r.input_tok) }}</td>
+        <td>{{ "{:,}".format(r.output_tok) }}</td>
+        <td>${{ "%.4f"|format(r.actual_cost) }}</td>
+        <td>{{ "{:,}".format(r.latency_ms) }}</td>
+        <td class="muted small">{{ r.route_reason }}</td>
+      </tr>
+      {% endfor %}
+
+      {% if in_flight %}
+      {# In-flight row — shown while the request is open. Elapsed
+         time is server-computed so it stays accurate even if the
+         browser tab is hidden. #}
+      <tr class="row-inflight">
+        <td>{{ turns|length + 1 }}</td>
+        <td class="muted small">now</td>
+        <td><span class="tier tier-{{ in_flight.tier }}">{{ in_flight.tier }}</span></td>
+        <td><code>{{ in_flight.model }}</code></td>
+        <td>{{ "{:,}".format(in_flight.in_tok_est) }} <span class="muted small">(est)</span></td>
+        <td class="muted">—</td>
+        <td>{% if in_flight.est_cost > 0 %}~${{ "%.4f"|format(in_flight.est_cost) }}{% else %}free{% endif %}</td>
+        <td class="elapsed">{{ "%.0f"|format(in_flight.elapsed_sec * 1000) }} <span class="muted small">(running)</span></td>
+        <td class="muted small">{{ in_flight.route_reason }}</td>
+      </tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  {% if not turns and not in_flight %}
+  <p class="muted">No turns recorded yet for this task.</p>
+  {% endif %}
+
+</div>

@@ -113,3 +113,17 @@ td code { font-size: 12px; color: var(--accent); }
 }
 .compose button:hover { filter: brightness(1.08); }
 details summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
+
+/* Task detail — live polling */
+.row-inflight {
+  background: rgba(61, 220, 151, 0.07);
+  animation: active-pulse 1.6s ease-in-out infinite;
+}
+.row-inflight td { border-bottom: 1px solid rgba(61, 220, 151, 0.18); }
+td.elapsed { color: var(--ok); font-variant-numeric: tabular-nums; }
+.active-dot {
+  color: var(--ok);
+  font-size: .6em;
+  vertical-align: middle;
+  animation: active-pulse 1.6s ease-in-out infinite;
+}
