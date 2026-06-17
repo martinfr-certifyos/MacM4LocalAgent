@@ -236,15 +236,21 @@ def tasks_one(request: Request, task_id: str) -> Any:
     ).fetchone()
     conn.close()
 
+    # This is an aggregate query (MIN), so it ALWAYS returns exactly one
+    # row -- `(None, None)` when the task_id matches nothing. Detect
+    # "not found" via a NULL task_text, not row presence, otherwise the
+    # 404 branch never fires and `int(started_ts)` below blows up on None.
+    has_db_row = text_row is not None and text_row[0] is not None
+
     # Allow opening the page for an in-flight task that has no DB rows yet.
     active_for_task = [a for a in _load_active() if a.get("task_id") == task_id]
-    if not text_row and not active_for_task:
+    if not has_db_row and not active_for_task:
         return HTMLResponse(f"<p>task {task_id} not found</p>", status_code=404)
 
-    task_text = (text_row[0] if text_row else None) or (
+    task_text = (text_row[0] if has_db_row else None) or (
         active_for_task[0].get("task_text_short") if active_for_task else "(no task text)"
     )
-    started_ts = text_row[1] if text_row else (
+    started_ts = (text_row[1] if has_db_row else None) or (
         active_for_task[0]["started"] if active_for_task else time.time()
     )
     summary = {
