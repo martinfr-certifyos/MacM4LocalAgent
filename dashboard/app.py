@@ -222,39 +222,72 @@ def tasks_list_fragment(request: Request) -> Any:
 
 @app.get("/tasks/{task_id}", response_class=HTMLResponse)
 def tasks_one(request: Request, task_id: str) -> Any:
-    """Drill-down: the full per-turn breakdown for one task. Useful
-    for understanding WHY a task escalated to Claude on turn 3."""
+    """Drill-down: static header + HTMX-polled live turns table.
+    The page shell loads instantly; the fragment at /tasks/{id}/_live
+    fills in the turns and keeps them up-to-date every 3 s."""
     conn = connect()
-    turns_rows = conn.execute(
-        "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, "
-        "shadow_cost, latency_ms, route_reason "
-        "FROM requests WHERE task_id = ? ORDER BY id ASC",
-        (task_id,),
-    ).fetchall()
-    if not turns_rows:
-        conn.close()
-        return HTMLResponse(f"<p>task {task_id} not found</p>", status_code=404)
-
-    turns = [dict(r) for r in turns_rows]
-    for r in turns:
-        r["ts_human"] = _fmt_ts(r["ts"])
-
-    # Pull the task_text once -- it's the same on every turn (router
-    # writes it identically for each request belonging to a task).
+    # Pull just the static header fields — task text and start time.
+    # Everything that changes (turns, tokens, latency) lives in the
+    # polled _live fragment so we don't duplicate query logic here.
     text_row = conn.execute(
-        "SELECT task_text FROM requests WHERE task_id = ? AND task_text IS NOT NULL LIMIT 1",
+        "SELECT task_text, MIN(ts) FROM requests "
+        "WHERE task_id = ? AND task_text IS NOT NULL LIMIT 1",
         (task_id,),
     ).fetchone()
     conn.close()
 
-    # Summary mirrors the fields shown on the index page so the same
-    # template macros (tier-badges, etc.) work without per-page
-    # special-casing.
+    # Allow opening the page for an in-flight task that has no DB rows yet.
+    active_for_task = [a for a in _load_active() if a.get("task_id") == task_id]
+    if not text_row and not active_for_task:
+        return HTMLResponse(f"<p>task {task_id} not found</p>", status_code=404)
+
+    task_text = (text_row[0] if text_row else None) or (
+        active_for_task[0].get("task_text_short") if active_for_task else "(no task text)"
+    )
+    started_ts = text_row[1] if text_row else (
+        active_for_task[0]["started"] if active_for_task else time.time()
+    )
+    summary = {
+        "task_text": task_text,
+        "started_human": _fmt_ts(int(started_ts)),
+    }
+    return templates.TemplateResponse(
+        request, "tasks_one.html",
+        {"task_id": task_id, "summary": summary},
+    )
+
+
+@app.get("/tasks/{task_id}/_live", response_class=HTMLResponse)
+def tasks_one_live(request: Request, task_id: str) -> Any:
+    """HTMX-polled fragment: turns table + in-flight row for one task.
+    Replaces the full #live-region on every poll so the user sees new
+    turns appear and the in-flight elapsed counter tick up."""
+    conn = connect()
+    turns_rows = conn.execute(
+        "SELECT id, ts, model, tier, input_tok, output_tok, actual_cost, "
+        "shadow_cost, latency_ms, route_reason "
+        "FROM requests WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    conn.close()
+
+    # Rows are newest-first from the DB; compute the logical turn number
+    # (1-based, ascending by time) before reversing so #1 is the oldest.
+    total = len(turns_rows)
+    turns = []
+    for i, r in enumerate(turns_rows):
+        d = dict(r)
+        d["turn_num"] = total - i   # newest row gets the highest number
+        d["ts_human"] = _fmt_ts(d["ts"])
+        turns.append(d)
+
+    # Find an active request belonging to this task.
+    active_for_task = [a for a in _load_active() if a.get("task_id") == task_id]
+    in_flight = active_for_task[0] if active_for_task else None
+
     summary: dict[str, Any] = {
-        "task_text": text_row[0] if text_row else "(no task text)",
-        "started_human": _fmt_ts(turns[0]["ts"]),
         "turns": len(turns),
-        "wall_seconds": max(0, turns[-1]["ts"] - turns[0]["ts"]),
+        "wall_seconds": max(0, turns[-1]["ts"] - turns[0]["ts"]) if turns else 0,
         "input_tok": sum(r["input_tok"] for r in turns),
         "output_tok": sum(r["output_tok"] for r in turns),
         "actual_cost": sum(r["actual_cost"] for r in turns),
@@ -265,8 +298,9 @@ def tasks_one(request: Request, task_id: str) -> Any:
         summary["tier_counts"][r["tier"]] = summary["tier_counts"].get(r["tier"], 0) + 1
 
     return templates.TemplateResponse(
-        request, "tasks_one.html",
-        {"task_id": task_id, "summary": summary, "turns": turns},
+        request, "_task_live.html",
+        {"task_id": task_id, "turns": turns, "in_flight": in_flight,
+         "summary": summary},
     )
 
 

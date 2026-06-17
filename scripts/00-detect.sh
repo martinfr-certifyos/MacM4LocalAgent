@@ -72,10 +72,16 @@ if [[ -n "$PREV_OLLAMA_TAG" ]]; then
     warn "Keeping installed OLLAMA_TAG='$OLLAMA_TAG' (default for this RAM tier would be '$OLLAMA_TAG_DEFAULT'; delete config/detected.env to reset)."
     # Recompute QUANT_TIER / MLX_QUANT / LOCAL_LONG_CTX from the *pinned*
     # tag so all derived values stay self-consistent.
+    # For q4 variants we use RAM_GB to decide context: ≥96 GB can afford
+    # 131072 (adds ~4.6 GiB KV cache on top of the ~45 GiB model weights),
+    # while 48-95 GB machines stay at 65536 to leave room for the OS.
     case "$OLLAMA_TAG" in
-      *:q8_0)        QUANT_TIER="q8";       MLX_QUANT="8bit"; LOCAL_LONG_CTX=131072 ;;
-      *:q4_K_M|*:q4_0) QUANT_TIER="q4";     MLX_QUANT="4bit"; LOCAL_LONG_CTX=65536 ;;
-      *)             QUANT_TIER="q4-small"; MLX_QUANT="4bit"; LOCAL_LONG_CTX=32768 ;;
+      *:q8_0) QUANT_TIER="q8"; MLX_QUANT="8bit"; LOCAL_LONG_CTX=131072 ;;
+      *:q4*)
+        QUANT_TIER="q4"; MLX_QUANT="4bit"
+        if (( RAM_GB >= 96 )); then LOCAL_LONG_CTX=131072
+        else LOCAL_LONG_CTX=65536; fi ;;
+      *) QUANT_TIER="q4-small"; MLX_QUANT="4bit"; LOCAL_LONG_CTX=32768 ;;
     esac
   fi
 else
@@ -122,9 +128,14 @@ esac
 # MLX is capped at 16k by the router (no TurboQuant in MLX yet)
 LOCAL_FAST_CTX=16384
 
-# Routing thresholds (tokens)
+# Routing thresholds (tokens).
+# ROUTE_LONG_MAX MUST equal LOCAL_LONG_CTX: any prompt that fits in the
+# local Ollama KV cache goes to local-long; anything larger escalates to
+# Claude. Mismatching these (e.g. ROUTE_LONG_MAX=128000 with
+# LOCAL_LONG_CTX=65536) causes Ollama to silently truncate prompts that
+# land in the gap — the bug this line was added to prevent.
 ROUTE_FAST_MAX=16000
-ROUTE_LONG_MAX=128000
+ROUTE_LONG_MAX=$LOCAL_LONG_CTX
 
 # Ollama runtime tunables.
 #  OLLAMA_NUM_PARALLEL=1: dedicate the full Metal pipeline to one request
