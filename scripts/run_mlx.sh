@@ -17,6 +17,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 exec "${REPO_ROOT}/.venvs/mlx/bin/python" \
     -m mlx_lm server \
-    --model "${MLX_LOCAL_DIR:-${REPO_ROOT}/models/mlx-community_Qwen2.5-Coder-7B-Instruct-4bit}" \
+    --model "${MLX_LOCAL_DIR:-${REPO_ROOT}/models/mlx-community_Qwen3-Coder-Next-4bit}" \
     --host 127.0.0.1 \
     --port "${MLX_PORT:-8081}"

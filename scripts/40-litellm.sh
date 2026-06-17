@@ -38,8 +38,10 @@ fi
 # from detected.env so renames in either backend don't strand the proxy.
 RENDERED="$REPO_ROOT/config/litellm-config.rendered.yaml"
 : "${MLX_REPO:?MLX_REPO missing from detected.env; rerun make detect}"
+: "${MLX_LOCAL_DIR:?MLX_LOCAL_DIR missing from detected.env; rerun make mlx}"
 sed -e "s|@@OLLAMA_TAG@@|$OLLAMA_TAG|g" \
     -e "s|@@MLX_REPO@@|$MLX_REPO|g" \
+    -e "s|@@MLX_LOCAL_DIR@@|$MLX_LOCAL_DIR|g" \
     -e "s|@@MLX_PORT@@|$MLX_PORT|g" \
     -e "s|@@OLLAMA_PORT@@|$OLLAMA_PORT|g" \
     "$TEMPLATE" > "$RENDERED"

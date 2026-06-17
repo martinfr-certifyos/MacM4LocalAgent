@@ -198,11 +198,11 @@ What this does, in order:
    downloads an MLX-quantized coder model. Tries
    `mlx-community/Qwen3-Coder-Next-{8bit,4bit}` first, falls back through
    `Qwen3-Coder-30B-A3B-Instruct-*` → `Qwen2.5-Coder-32B-Instruct-*` →
-   `Qwen2.5-Coder-7B-Instruct-*`. **On most machines today it lands on
-   `Qwen2.5-Coder-7B-Instruct-4bit`** (~5 GB) because the Qwen3-Coder-Next
-   MLX repos sit on HF Xet CAS and return 416 errors for unauthenticated
-   downloads of the larger shards. Set `HF_TOKEN=...` to skip those
-   errors.
+   `Qwen2.5-Coder-7B-Instruct-*`. On machines with ≥ 48 GB RAM it lands on
+   `Qwen3-Coder-Next-4bit` (~20 GB). On networks where HF Xet CAS returns
+   416 errors for unauthenticated downloads, it falls back to
+   `Qwen2.5-Coder-7B-Instruct-4bit` (~5 GB). Set `HF_TOKEN=...` to avoid
+   those errors and get the best model.
 4. `scripts/40-litellm.sh` — creates `.venvs/litellm`, installs LiteLLM,
    renders `config/litellm-config.yaml` → `config/litellm-config.rendered.yaml`
    with the detected ports / model tags substituted in. **No auth gate**
@@ -457,7 +457,7 @@ then any explicit **prompt tag** you add.
 
 | Prompt tag / condition | Token count | Local model | Cloud model | Cloud auth | Cost |
 | --- | --- | --- | --- | --- | --- |
-| *(auto, no tag)* | ≤ 16 k | **MLX** – Qwen2.5-Coder-7B-4bit (`:8081`) | — | — | free |
+| *(auto, no tag)* | ≤ 16 k | **MLX** – Qwen3-Coder-Next-4bit (`:8081`) | — | — | free |
 | *(auto, no tag)* | 16 k – 128 k | **Ollama** – Qwen3-Coder-Next q4\_K\_M (`:11434`) | — | — | free |
 | *(auto, complex task)* | any | — | **claude-opus-4-7** | `ANTHROPIC_API_KEY` ¹ | ~$5/MTok in |
 | *(auto, >128 k)* – **Cline** | > 128 k | — | **claude-opus-4-7** | `ANTHROPIC_API_KEY` ¹ | ~$5/MTok in |
@@ -492,7 +492,7 @@ Apply a mode change with `make restart` (no reinstall needed).
 
 | Tier | Model | Approx size on disk | Context window | Used when |
 | --- | --- | --- | --- | --- |
-| **local-fast** | `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` (MLX, `:8081`) | ~5 GB | 16 k tokens | prompt ≤ 16 k, not complex |
+| **local-fast** | `mlx-community/Qwen3-Coder-Next-4bit` (MLX, `:8081`) | ~20 GB | 16 k tokens | prompt ≤ 16 k, not complex |
 | **local-long** | `qwen3-coder-next:q4_K_M` (Ollama GGUF, `:11434`) | ~45 GB | ~64 k tokens | 16 k < prompt ≤ 128 k, or any Claude Code small request |
 
 Both are downloaded automatically by `make install`. Use `[local]` in a Cline prompt to force local-long
@@ -508,7 +508,7 @@ the **current** `config/litellm-config.yaml`:
 
 | Tier               | Backend             | Model                                                                       | Context | Cost                     | Auto-pulled? |
 | ------------------ | ------------------- | --------------------------------------------------------------------------- | ------- | ------------------------ | ------------ |
-| `local-fast`       | MLX :8081           | `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` (after HF Xet fallback)      | ≤16 k   | free                     | yes (~5 GB)  |
+| `local-fast`       | MLX :8081           | `mlx-community/Qwen3-Coder-Next-4bit` (falls back to 7B on HF Xet failure)  | ≤16 k   | free                     | yes (~20 GB) |
 | `local-long`       | Ollama :11434       | `qwen3-coder-next:q4_K_M` (GGUF)                                            | ~64 k   | free                     | yes (~45 GB) |
 | `claude-haiku-4-5` | Anthropic API       | `claude-haiku-4-5`                                                          | 200 k   | $1 in / $5 out per MTok  | n/a (API)    |
 | `claude-sonnet-4-6`| Anthropic API       | `claude-sonnet-4-6`                                                         | 1 M     | $3 in / $15 out per MTok | n/a (API)    |

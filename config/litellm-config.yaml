@@ -2,9 +2,12 @@ model_list:
   - model_name: local-fast
     litellm_params:
       # The upstream model id MUST match what mlx_lm.server exposes via
-      # /v1/models. We point at the Hugging Face id form because the absolute
-      # filesystem path form has slashes that confuse some clients.
-      model: openai/@@MLX_REPO@@
+      # /v1/models. mlx_lm.server is started with --model <absolute-path>
+      # (MLX_LOCAL_DIR), so it advertises that path as the model id. Sending
+      # the HF repo id (MLX_REPO) instead causes mlx_lm to treat the request
+      # model as unknown and trigger a snapshot_download — the duplicate cache
+      # bug. Always use the local filesystem path here.
+      model: openai/@@MLX_LOCAL_DIR@@
       api_base: http://127.0.0.1:@@MLX_PORT@@/v1
       api_key: not-needed
       input_cost_per_token: 0.0
@@ -91,7 +94,7 @@ model_list:
     # the three real groups above before LiteLLM dispatches upstream, so the
     # upstream params here are never actually used. We keep them harmless.
     litellm_params:
-      model: openai/@@MLX_REPO@@
+      model: openai/@@MLX_LOCAL_DIR@@
       api_base: http://127.0.0.1:@@MLX_PORT@@/v1
       api_key: not-needed
 
@@ -108,7 +111,7 @@ model_list:
   # / CLI / benches, keep using the short names (`local-agent`, etc.).
   - model_name: gpt-local-fast
     litellm_params:
-      model: openai/@@MLX_REPO@@
+      model: openai/@@MLX_LOCAL_DIR@@
       api_base: http://127.0.0.1:@@MLX_PORT@@/v1
       api_key: not-needed
       input_cost_per_token: 0.0
@@ -174,7 +177,7 @@ model_list:
 
   - model_name: gpt-hybrid-auto
     litellm_params:
-      model: openai/@@MLX_REPO@@
+      model: openai/@@MLX_LOCAL_DIR@@
       api_base: http://127.0.0.1:@@MLX_PORT@@/v1
       api_key: not-needed
 
