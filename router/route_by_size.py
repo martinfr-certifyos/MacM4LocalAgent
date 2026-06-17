@@ -1006,6 +1006,17 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                 if cline_mode:
                     model, reason, tokens = decide_tier_cline(msgs)
                     reason = f"cline-mode: {reason}"
+                    # decide_tier_cline's token count is just the
+                    # <task>-envelope estimate (surfaced in the reason as
+                    # "task=N tok") because routing is by task complexity,
+                    # not harness size. But the in-flight dashboard row and
+                    # its cost estimate want the ACTUAL prompt size being
+                    # processed -- otherwise a 60K-token Cline turn shows a
+                    # frozen "111 (est)" for minutes, then jumps to the real
+                    # number only when the turn completes. Recompute the full
+                    # request estimate for display/cost; the routing decision
+                    # itself already used the task estimate above.
+                    tokens = _estimate_tokens(msgs)
                 else:
                     model, reason, tokens = decide_tier(msgs)
                 data["model"] = model

@@ -511,6 +511,31 @@ def test_decide_tier_cline_default_routes_to_local_long() -> None:
     assert "default" in reason
 
 
+def test_pre_call_cline_stamps_full_request_estimate(router: SizeBasedRouter) -> None:
+    """The in-flight dashboard row reads `route_tokens_estimated`. For
+    Cline traffic the router used to stamp the tiny <task>-envelope
+    estimate there (so a 60K-token turn showed a frozen "111 (est)" for
+    minutes, then jumped to the real number only on completion). The
+    pre-call hook must stamp the FULL request estimate so the live row
+    reflects the real prompt size being processed -- while the reason
+    string still attributes the small task size for cost accounting."""
+    task = "Add a comment to main.py"
+    # A large prior tool result so the full request dwarfs the task text.
+    big_history = {"role": "user", "content": "log line output\n" * 4000}
+    msgs = _cline_msgs(task, {"role": "assistant", "content": "ok"}, big_history)
+    data: dict[str, Any] = {"model": "hybrid-auto", "messages": msgs}
+
+    new = asyncio.run(router.async_pre_call_hook(None, None, data, "completion"))
+    assert new is not None
+    meta = new["metadata"]
+    # Reason still carries the small <task>-text attribution...
+    assert "task=" in meta["route_reason"]
+    # ...but the estimate driving the live row is the full prompt size.
+    task_tokens = max(1, len(task) // 4)
+    assert meta["route_tokens_estimated"] == _estimate_tokens(msgs)
+    assert meta["route_tokens_estimated"] > task_tokens * 10
+
+
 # ---- M5: context saturation routing signal ------------------------------------
 
 @pytest.fixture
