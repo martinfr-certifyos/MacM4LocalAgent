@@ -5,20 +5,23 @@
   <key>Label</key>           <string>com.local.ollama-warm</string>
   <key>RunAtLoad</key>       <true/>
   <key>KeepAlive</key>       <false/>
-  <key>WorkingDirectory</key><string>@@REPO_ROOT@@</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>          <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>          <string>@@HOME@@</string>
+    <key>USER</key>          <string>@@USER@@</string>
+    <key>TMPDIR</key>        <string>@@TMPDIR@@</string>
     <key>OLLAMA_HOST</key>   <string>127.0.0.1:@@OLLAMA_PORT@@</string>
     <key>OLLAMA_TAG</key>    <string>@@OLLAMA_TAG@@</string>
     <key>WARM_WAIT_S</key>   <string>180</string>
   </dict>
+  <!-- See com.local.ollama.plist: logs are redirected by the child shell
+       because launchd cannot open files under ~/Documents (TCC). -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>@@REPO_ROOT@@/scripts/warm-ollama.sh</string>
+    <string>-c</string>
+    <string>cd "@@REPO_ROOT@@" &amp;&amp; exec /bin/bash "@@REPO_ROOT@@/scripts/warm-ollama.sh" &gt;&gt; "@@REPO_ROOT@@/.logs/ollama-warm.out.log" 2&gt;&gt; "@@REPO_ROOT@@/.logs/ollama-warm.err.log"</string>
   </array>
-  <key>StandardOutPath</key><string>@@REPO_ROOT@@/.logs/ollama-warm.out.log</string>
-  <key>StandardErrorPath</key><string>@@REPO_ROOT@@/.logs/ollama-warm.err.log</string>
 </dict>
 </plist>

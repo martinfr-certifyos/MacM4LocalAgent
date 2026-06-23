@@ -5,21 +5,21 @@
   <key>Label</key>          <string>com.local.litellm</string>
   <key>RunAtLoad</key>      <true/>
   <key>KeepAlive</key>      <true/>
-  <key>WorkingDirectory</key><string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>      <string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.venvs/litellm/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>      <string>/Users/martinfr</string>
+    <key>USER</key>      <string>martinfr</string>
+    <key>TMPDIR</key>    <string>/var/folders/6c/pyk36nb12vn1t4ynjrq_hkth0000gn/T/</string>
     <key>PYTHONPATH</key><string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent</string>
   </dict>
+  <!-- See com.local.ollama.plist: logs are redirected by the child shell
+       because launchd cannot open files under ~/Documents (TCC). -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.venvs/litellm/bin/python</string>
-    <string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/scripts/run_litellm.py</string>
-    <string>--config</string><string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/config/litellm-config.rendered.yaml</string>
-    <string>--host</string><string>127.0.0.1</string>
-    <string>--port</string><string>4000</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>cd "/Users/martinfr/Documents/GitHub/MacM4LocalAgent" &amp;&amp; exec "/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.venvs/litellm/bin/python" "/Users/martinfr/Documents/GitHub/MacM4LocalAgent/scripts/run_litellm.py" --config "/Users/martinfr/Documents/GitHub/MacM4LocalAgent/config/litellm-config.rendered.yaml" --host 127.0.0.1 --port 4000 &gt;&gt; "/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.logs/litellm.out.log" 2&gt;&gt; "/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.logs/litellm.err.log"</string>
   </array>
-  <key>StandardOutPath</key><string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.logs/litellm.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/martinfr/Documents/GitHub/MacM4LocalAgent/.logs/litellm.err.log</string>
 </dict>
 </plist>
