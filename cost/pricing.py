@@ -31,7 +31,7 @@ from dataclasses import dataclass
 # When the table below was last reconciled with Anthropic's docs.
 # scripts/check_claude_pricing.py compares against this and the
 # startup nag fires when this is more than PRICING_STALE_DAYS old.
-PRICING_LAST_UPDATED = "2026-05-02"
+PRICING_LAST_UPDATED = "2026-06-17"
 PRICING_STALE_DAYS = 30
 
 # The model whose rates define `shadow_cost`. shadow_cost is the
@@ -69,6 +69,29 @@ def _per_token(per_mtok: float) -> float:
 # Source of truth: https://docs.anthropic.com/en/docs/about-claude/pricing
 # Last reconciled: see PRICING_LAST_UPDATED above.
 CLAUDE_PRICES: dict[str, ClaudeRate] = {
+    # claude-fable-5 / claude-mythos-5: new flagship creative/reasoning tier
+    # ($10/$50 per MTok). Cache rates extrapolated at 1.25x/2x/0.1x input.
+    "claude-fable-5": ClaudeRate(
+        input=_per_token(10.0),
+        output=_per_token(50.0),
+        cache_write_5m=_per_token(12.50),
+        cache_write_1h=_per_token(20.0),
+        cache_read=_per_token(1.00),
+    ),
+    "claude-mythos-5": ClaudeRate(
+        input=_per_token(10.0),
+        output=_per_token(50.0),
+        cache_write_5m=_per_token(12.50),
+        cache_write_1h=_per_token(20.0),
+        cache_read=_per_token(1.00),
+    ),
+    "claude-opus-4-8": ClaudeRate(
+        input=_per_token(5.0),
+        output=_per_token(25.0),
+        cache_write_5m=_per_token(6.25),
+        cache_write_1h=_per_token(10.0),
+        cache_read=_per_token(0.50),
+    ),
     "claude-opus-4-7": ClaudeRate(
         input=_per_token(5.0),
         output=_per_token(25.0),
@@ -125,7 +148,7 @@ CLAUDE_PRICES: dict[str, ClaudeRate] = {
         cache_write_1h=_per_token(6.0),
         cache_read=_per_token(0.30),
     ),
-    "claude-sonnet-3-7": ClaudeRate(  # deprecated, kept for historical rows
+    "claude-sonnet-3-7": ClaudeRate(  # deprecated upstream; kept for historical cost rows
         input=_per_token(3.0),
         output=_per_token(15.0),
         cache_write_5m=_per_token(3.75),
@@ -146,14 +169,14 @@ CLAUDE_PRICES: dict[str, ClaudeRate] = {
         cache_write_1h=_per_token(1.6),
         cache_read=_per_token(0.08),
     ),
-    "claude-opus-3": ClaudeRate(  # deprecated
+    "claude-opus-3": ClaudeRate(  # deprecated upstream; kept for historical cost rows
         input=_per_token(15.0),
         output=_per_token(75.0),
         cache_write_5m=_per_token(18.75),
         cache_write_1h=_per_token(30.0),
         cache_read=_per_token(1.50),
     ),
-    "claude-haiku-3": ClaudeRate(
+    "claude-haiku-3": ClaudeRate(  # deprecated upstream; kept for historical cost rows
         input=_per_token(0.25),
         output=_per_token(1.25),
         cache_write_5m=_per_token(0.30),
@@ -168,8 +191,11 @@ _ALIASES: dict[str, str] = {
     # LiteLLM/Anthropic shorthand sometimes uses underscores or no hyphens.
     "claude-sonnet-4.6": "claude-sonnet-4-6",
     "claude-opus-4.7":   "claude-opus-4-7",
+    "claude-opus-4.8":   "claude-opus-4-8",
     "claude-opus-4.6":   "claude-opus-4-6",
     "claude-haiku-4.5":  "claude-haiku-4-5",
+    "claude-fable-5.0":  "claude-fable-5",
+    "claude-mythos-5.0": "claude-mythos-5",
     # The "claude-code" tier alias used internally by this proxy. Must
     # match the upstream `model` field for `claude-code` in
     # config/litellm-config.yaml. If you change one, change both.
