@@ -60,11 +60,23 @@ def test_pre_call_enables_claude_thinking(monkeypatch: Any) -> None:
         "top_p": 0.9,
     }
     out = _run(_router(), data)
-    assert out["thinking"]["type"] == "enabled"
-    assert out["thinking"]["budget_tokens"] >= 1024
+    assert out["thinking"] == {"type": "adaptive"}
+    assert out["output_config"]["effort"] in {"low", "medium", "high", "xhigh", "max"}
     assert out["temperature"] == 1
     assert "top_p" not in out
     assert out["metadata"]["claude_thinking_enabled"] is True
+
+
+def test_pre_call_skips_thinking_for_claude_haiku(monkeypatch: Any) -> None:
+    """Haiku tiers don't support adaptive thinking — injecting it 400s, so skip."""
+    monkeypatch.setattr(rbs, "ENABLE_THINKING_MODE", True)
+    data = {
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    out = _run(_router(), data)
+    assert "thinking" not in out
+    assert not out.get("metadata", {}).get("claude_thinking_enabled")
 
 
 def test_pre_call_skips_think_for_non_qwen3_local(monkeypatch: Any, qwen3_env: None) -> None:

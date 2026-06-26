@@ -144,7 +144,7 @@ of an empty indicator. This works for **both** tiers and is controlled by
 | Tier | Mechanism | What the client receives |
 | --- | --- | --- |
 | local (Qwen3) | `/think` directive injected into the last user message | Qwen3 emits an inline `<think>…</think>` trace; the streaming hook re-routes it onto the `reasoning_content` delta channel |
-| Claude | `thinking={"type":"enabled","budget_tokens":N}` added to the request (forces `temperature=1`, drops `top_p`, floors `max_tokens`) | Anthropic extended-thinking blocks, surfaced by LiteLLM as `reasoning_content` deltas |
+| Claude | `thinking={"type":"adaptive"}` + `output_config.effort` added to the request (forces `temperature=1`, drops `top_p`/`top_k`, floors `max_tokens`) | Anthropic adaptive extended-thinking blocks, surfaced by LiteLLM as `reasoning_content` deltas |
 
 ### Local tier is gated on the *real* model, not the alias
 
@@ -160,21 +160,34 @@ This avoids silently prepending the literal string `/think ` to a model
 that has no such switch (which would corrupt the prompt) if
 `MLX_LOCAL_DIR` is ever repointed to a non-Qwen3 model.
 
+### Claude tier uses adaptive thinking (and skips Haiku)
+
+Current Anthropic models (Opus 4.6+, Sonnet 4.6+, and Opus 4.7/4.8 where
+it is the *only* mode) require **adaptive** thinking
+(`thinking={"type":"adaptive"}` + an `output_config.effort` knob). The
+legacy `{"type":"enabled","budget_tokens":N}` form returns a **400** on
+Opus 4.7/4.8, so it is no longer used. Adaptive is **not** supported on
+Haiku tiers, so the hook skips any model whose name contains `haiku`
+(injecting it there would 400). `effort` defaults to `high` (Anthropic's
+own default — "almost always thinks").
+
 ### max_tokens interaction
 
 On a local `/think` turn the reasoning trace shares the `max_tokens`
 budget with the answer, and the over-generation static guardrail has just
 clamped that to ~6k. The hook therefore re-asserts a higher floor
 (`ROUTER_THINKING_LOCAL_MAX`, default 12288) *after* the guardrail so the
-trace can't truncate the response. For Claude, `max_tokens` is floored at
-`budget + headroom` by the thinking-params step.
+trace can't truncate the response. For Claude, `max_tokens` is a hard cap
+over thinking + visible answer, so it is floored at
+`CLAUDE_THINKING_MAX_TOKENS_FLOOR` (8192) so a tiny inbound cap (Cline
+sometimes sends 1) can't starve the trace.
 
 ### Tunables
 
 | Env var | Default | Effect |
 | --- | --- | --- |
 | `ROUTER_THINKING` | `1` | Master switch for thinking mode (both tiers). |
-| `ROUTER_THINKING_BUDGET` | `2048` | Claude `budget_tokens` (clamped to ≥1024). |
+| `ROUTER_THINKING_EFFORT` | `high` | Claude adaptive-thinking effort: `low`/`medium`/`high`/`xhigh`/`max` (unknown → default). |
 | `ROUTER_THINKING_LOCAL_MAX` | `12288` | `max_tokens` floor for local `/think` turns. |
 | `ROUTER_THINK_INJECTION` | `1` | Legacy: inject `/think` only on the explicit `[local]` tag when `ROUTER_THINKING` is off. |
 

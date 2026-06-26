@@ -45,7 +45,7 @@ from router.offline_mode import (  # noqa: E402
     offline_reason,
 )
 from router.overgeneration_control import (  # noqa: E402
-    CLAUDE_THINKING_BUDGET_DEFAULT,
+    CLAUDE_THINKING_EFFORT_DEFAULT,
     _looks_like_cline,
     _model_supports_think,
     apply_claude_thinking_params,
@@ -127,15 +127,16 @@ ENABLE_THINK_INJECTION = _control_flag("ROUTER_THINK_INJECTION", "1")
 ENABLE_THINKING_MODE = _control_flag("ROUTER_THINKING", "1")
 
 
-def _thinking_budget() -> int:
-    """Claude extended-thinking budget in tokens (env override)."""
-    raw = os.environ.get("ROUTER_THINKING_BUDGET") or _ENV.get(
-        "ROUTER_THINKING_BUDGET", str(CLAUDE_THINKING_BUDGET_DEFAULT)
+def _thinking_effort() -> str:
+    """Claude adaptive-thinking effort level (env override).
+
+    One of low|medium|high|xhigh|max; unknown values fall back to the
+    default. `high` is Anthropic's default ("almost always thinks").
+    """
+    raw = os.environ.get("ROUTER_THINKING_EFFORT") or _ENV.get(
+        "ROUTER_THINKING_EFFORT", CLAUDE_THINKING_EFFORT_DEFAULT
     )
-    try:
-        return max(1024, int(raw))
-    except (TypeError, ValueError):
-        return CLAUDE_THINKING_BUDGET_DEFAULT
+    return str(raw).strip().lower() or CLAUDE_THINKING_EFFORT_DEFAULT
 
 
 # When /think is injected on a local Qwen3 turn the <think> reasoning
@@ -1230,8 +1231,15 @@ class SizeBasedRouter(_LiteLLMCustomLogger):
                     meta = data.setdefault("metadata", {})
                     meta["qwen3_think_injected"] = True
 
-            if ENABLE_THINKING_MODE and _is_claude_model_name(model_name):
-                apply_claude_thinking_params(data, budget=_thinking_budget())
+            # Adaptive thinking is unsupported on Haiku tiers, so skip them
+            # (injecting it 400s). Opus/Sonnet 4.6+ and the default
+            # claude-code (Opus) tier all accept it.
+            if (
+                ENABLE_THINKING_MODE
+                and _is_claude_model_name(model_name)
+                and "haiku" not in (model_name or "").lower()
+            ):
+                apply_claude_thinking_params(data, effort=_thinking_effort())
                 meta = data.setdefault("metadata", {})
                 meta["claude_thinking_enabled"] = True
 

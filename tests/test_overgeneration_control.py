@@ -651,27 +651,49 @@ def test_model_supports_think_excludes_claude() -> None:
 
 # ---- M6c: Claude extended-thinking params ------------------------------------
 
-def test_apply_claude_thinking_params_sets_block_and_sampling() -> None:
-    from router.overgeneration_control import apply_claude_thinking_params
-    data: dict[str, Any] = {"model": "claude-opus-4-7", "temperature": 0.2, "top_p": 0.9}
-    apply_claude_thinking_params(data, budget=2048)
-    assert data["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+def test_apply_claude_thinking_params_sets_adaptive_block_and_sampling() -> None:
+    from router.overgeneration_control import (
+        CLAUDE_THINKING_MAX_TOKENS_FLOOR,
+        apply_claude_thinking_params,
+    )
+    data: dict[str, Any] = {
+        "model": "claude-opus-4-7",
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 40,
+    }
+    apply_claude_thinking_params(data, effort="high")
+    # Adaptive form (legacy {"type":"enabled","budget_tokens"} 400s on Opus 4.7+).
+    assert data["thinking"] == {"type": "adaptive"}
+    assert data["output_config"] == {"effort": "high"}
     assert data["temperature"] == 1
     assert "top_p" not in data
-    # max_tokens floored above the budget so the trace + answer both fit.
-    assert data["max_tokens"] > 2048
+    assert "top_k" not in data
+    # max_tokens floored so a tiny inbound cap can't starve the trace.
+    assert data["max_tokens"] == CLAUDE_THINKING_MAX_TOKENS_FLOOR
 
 
 def test_apply_claude_thinking_params_respects_larger_max_tokens() -> None:
     from router.overgeneration_control import apply_claude_thinking_params
     data: dict[str, Any] = {"model": "claude-opus-4-7", "max_tokens": 50000}
-    apply_claude_thinking_params(data, budget=2048)
+    apply_claude_thinking_params(data, effort="medium")
     assert data["max_tokens"] == 50000
+    assert data["output_config"]["effort"] == "medium"
 
 
-def test_apply_claude_thinking_params_clamps_min_budget() -> None:
-    """Anthropic requires budget_tokens >= 1024."""
-    from router.overgeneration_control import apply_claude_thinking_params
+def test_apply_claude_thinking_params_unknown_effort_falls_back_to_default() -> None:
+    from router.overgeneration_control import (
+        CLAUDE_THINKING_EFFORT_DEFAULT,
+        apply_claude_thinking_params,
+    )
     data: dict[str, Any] = {"model": "claude-opus-4-7"}
-    apply_claude_thinking_params(data, budget=10)
-    assert data["thinking"]["budget_tokens"] >= 1024
+    apply_claude_thinking_params(data, effort="bogus")
+    assert data["thinking"] == {"type": "adaptive"}
+    assert data["output_config"]["effort"] == CLAUDE_THINKING_EFFORT_DEFAULT
+
+
+def test_apply_claude_thinking_params_preserves_existing_output_config() -> None:
+    from router.overgeneration_control import apply_claude_thinking_params
+    data: dict[str, Any] = {"model": "claude-opus-4-7", "output_config": {"foo": "bar"}}
+    apply_claude_thinking_params(data, effort="max")
+    assert data["output_config"] == {"foo": "bar", "effort": "max"}
