@@ -181,15 +181,20 @@ def _model_supports_think(model: str | None) -> bool:
     return _THINK_CAPABLE_SIGNATURE in canonical
 
 
-# Claude extended-thinking defaults. Anthropic streams a `thinking`
+# Claude adaptive-thinking defaults. Anthropic streams a `thinking`
 # content block (surfaced by LiteLLM as `delta.reasoning_content`) only
-# when the request carries `thinking={"type":"enabled","budget_tokens":N}`.
-# Without it the model emits no reasoning trace at all, so Cline shows an
-# empty "thinking" indicator. budget_tokens must be >=1024 per Anthropic;
-# max_tokens must exceed the budget (the budget is *part* of the output
-# allowance), so we floor max_tokens at budget + a response headroom.
-CLAUDE_THINKING_BUDGET_DEFAULT = 2048
-CLAUDE_THINKING_RESPONSE_HEADROOM = 4096
+# when the request asks for extended thinking. Current models (Opus 4.6+,
+# Sonnet 4.6+, and Opus 4.7/4.8 where it is the ONLY mode) use
+# `thinking={"type":"adaptive"}` plus an optional `output_config.effort`
+# knob; the legacy `{"type":"enabled","budget_tokens":N}` form returns a
+# 400 on Opus 4.7+. Thinking is incompatible with custom temperature/top_k,
+# so we pin temperature=1 and drop top_p/top_k. effort defaults to "high"
+# (Anthropic's own default -- "almost always thinks") so Cline reliably
+# sees a reasoning trace. max_tokens is a hard cap over thinking + answer,
+# so we floor it to keep a tiny inbound cap from starving the trace.
+CLAUDE_THINKING_EFFORT_DEFAULT = "high"
+_CLAUDE_THINKING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+CLAUDE_THINKING_MAX_TOKENS_FLOOR = 8192
 
 # Models we treat as "local" for the purposes of these controls.
 # Includes both the alias names and common upstream id prefixes that
@@ -519,28 +524,36 @@ def inject_qwen3_think_directive(data: dict[str, Any]) -> dict[str, Any]:
 
 def apply_claude_thinking_params(
     data: dict[str, Any],
-    budget: int = CLAUDE_THINKING_BUDGET_DEFAULT,
+    effort: str = CLAUDE_THINKING_EFFORT_DEFAULT,
 ) -> dict[str, Any]:
-    """Enable Anthropic extended thinking on a Claude-tier request.
+    """Enable Anthropic *adaptive* extended thinking on a Claude-tier request.
 
-    Sets the `thinking` block, forces the Anthropic-required sampling
-    params (temperature must be 1 and top_p must be unset when thinking
-    is enabled), and floors `max_tokens` above the reasoning budget so
-    the model has room for both the thinking trace and a final answer.
+    Sets `thinking={"type":"adaptive"}` and an `output_config.effort` knob
+    (the model decides when/how deeply to think; effort is soft guidance),
+    forces the Anthropic-required sampling params (temperature must be 1 and
+    top_p/top_k must be unset when thinking is on), and floors `max_tokens`
+    so a tiny inbound cap can't starve the reasoning trace.
 
-    Idempotent and never raises -- a control that crashes the request
-    path is worse than no thinking. Mutates and returns `data`.
+    Uses adaptive rather than the legacy `{"type":"enabled","budget_tokens"}`
+    form, which 400s on Opus 4.7/4.8. Unknown effort values fall back to the
+    default. Idempotent and never raises -- a control that crashes the
+    request path is worse than no thinking. Mutates and returns `data`.
     """
     try:
-        budget = max(1024, int(budget))
-        data["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        # Anthropic rejects temperature != 1 / any top_p when thinking is on.
+        data["thinking"] = {"type": "adaptive"}
+        eff = effort if effort in _CLAUDE_THINKING_EFFORTS else CLAUDE_THINKING_EFFORT_DEFAULT
+        output_config = data.get("output_config")
+        if not isinstance(output_config, dict):
+            output_config = {}
+        output_config["effort"] = eff
+        data["output_config"] = output_config
+        # Anthropic rejects temperature != 1 / any top_p|top_k when thinking is on.
         data["temperature"] = 1
         data.pop("top_p", None)
-        floor = budget + CLAUDE_THINKING_RESPONSE_HEADROOM
+        data.pop("top_k", None)
         current = data.get("max_tokens")
-        if not isinstance(current, int) or current < floor:
-            data["max_tokens"] = floor
+        if not isinstance(current, int) or current < CLAUDE_THINKING_MAX_TOKENS_FLOOR:
+            data["max_tokens"] = CLAUDE_THINKING_MAX_TOKENS_FLOOR
     except Exception:
         pass
     return data
